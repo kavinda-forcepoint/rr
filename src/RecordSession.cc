@@ -935,7 +935,7 @@ static void save_interrupted_syscall_ret_in_syscallbuf(RecordTask* t,
 }
 
 static bool is_in_privileged_syscall(RecordTask* t) {
-  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->ip());
+  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
   return type && type->privileged == AddressSpace::PRIVILEGED;
 }
 
@@ -2008,7 +2008,8 @@ static string lookup_by_path(const string& name) {
     BindCPU bind_cpu,
     const string& output_trace_dir,
     const TraceUuid* trace_id,
-    bool use_audit) {
+    bool use_audit,
+    bool unmap_vdso) {
   // The syscallbuf library interposes some critical
   // external symbols like XShmQueryExtension(), so we
   // preload it whether or not syscallbuf is enabled. Indicate here whether
@@ -2105,7 +2106,7 @@ static string lookup_by_path(const string& name) {
   shr_ptr session(
       new RecordSession(full_path, argv, env, disable_cpuid_features,
                         syscallbuf, syscallbuf_desched_sig, bind_cpu,
-                        output_trace_dir, trace_id, use_audit));
+                        output_trace_dir, trace_id, use_audit, unmap_vdso));
   session->set_asan_active(!exe_info.libasan_path.empty() ||
                            exe_info.has_asan_symbols);
   return session;
@@ -2120,7 +2121,8 @@ RecordSession::RecordSession(const std::string& exe_path,
                              BindCPU bind_cpu,
                              const string& output_trace_dir,
                              const TraceUuid* trace_id,
-                             bool use_audit)
+                             bool use_audit,
+                             bool unmap_vdso)
     : trace_out(argv[0], output_trace_dir, ticks_semantics_),
       scheduler_(*this),
       trace_id(trace_id),
@@ -2136,7 +2138,8 @@ RecordSession::RecordSession(const std::string& exe_path,
       enable_chaos_(false),
       asan_active_(false),
       wait_for_all_(false),
-      use_audit_(use_audit) {
+      use_audit_(use_audit),
+      unmap_vdso_(unmap_vdso) {
   if (!has_cpuid_faulting() &&
       disable_cpuid_features.any_features_disabled()) {
     FATAL() << "CPUID faulting required to disable CPUID features";
@@ -2153,8 +2156,11 @@ RecordSession::RecordSession(const std::string& exe_path,
       Task::spawn(*this, error_fd, &tracee_socket_fd(),
                   &tracee_socket_fd_number,
                   exe_path, argv, envp));
-  // CPU affinity has been set.
-  trace_out.setup_cpuid_records(has_cpuid_faulting(), disable_cpuid_features_);
+
+  if (NativeArch::arch() == x86 || NativeArch::arch() == x86_64) {
+    // CPU affinity has been set.
+    trace_out.setup_cpuid_records(has_cpuid_faulting(), disable_cpuid_features_);
+  }
 
   initial_thread_group = t->thread_group();
   on_create(t);

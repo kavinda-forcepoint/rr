@@ -27,7 +27,22 @@ using namespace std;
 
 namespace rr {
 
-/*static*/ const uint8_t AddressSpace::breakpoint_insn;
+static const uint8_t x86_breakpoint_insn[] = { 0xcc }; // int $3
+static const uint8_t arm64_breakpoint_insn[4] = {0x0, 0x0, 0x20, 0xd4}; // brk #0
+
+static const uint8_t *breakpoint_insn(SupportedArch arch) {
+  switch (arch) {
+    case x86:
+    case x86_64:
+      return x86_breakpoint_insn;
+    case aarch64:
+      return arm64_breakpoint_insn;
+    default:
+      DEBUG_ASSERT(0 && "Must define breakpoint insn for this architecture");
+      return nullptr;
+  }
+}
+
 
 /**
  * Advance *str to skip leading blank characters.
@@ -246,6 +261,10 @@ uint32_t AddressSpace::offset_to_syscall_in_vdso[SupportedArch_MAX + 1];
 
 remote_code_ptr AddressSpace::find_syscall_instruction(Task* t) {
   SupportedArch arch = t->arch();
+  // This assert passes even if --unmap-vdso is passed because this only ever
+  // gets called at the start of process_execve before we unmap the vdso. After
+  // the rr page is mapped in, we use the syscall instructions contained therein
+  ASSERT(t, has_vdso()) << "Kernel with vDSO disabled?";
   if (!offset_to_syscall_in_vdso[arch]) {
     auto vdso_data = t->read_mem(vdso().start().cast<uint8_t>(), vdso().size());
     offset_to_syscall_in_vdso[arch] = find_offset_of_syscall_instruction_in(
@@ -266,6 +285,9 @@ static string find_rr_page_file(Task* t) {
       break;
     case x86_64:
       path += "64";
+      break;
+    case aarch64:
+      path += "arm64";
       break;
     default:
       ASSERT(t, false) << "Unknown architecture";
@@ -357,22 +379,61 @@ static const AddressSpace::SyscallType entry_points[] = {
     AddressSpace::RECORDING_ONLY },
 };
 
-static remote_code_ptr entry_ip_from_index(size_t i) {
-  return remote_code_ptr(RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * i);
+static int rr_page_syscall_stub_size(SupportedArch arch) {
+  int val = 0;
+  switch (arch) {
+    case x86:
+    case x86_64:
+      val = 3;
+      break;
+    case aarch64:
+      val = 8;
+      break;
+    default:
+      FATAL() << "Syscall stub size not defined for this architecture";
+  }
+  if (arch == NativeArch::arch()) {
+    DEBUG_ASSERT(val == RR_PAGE_SYSCALL_STUB_SIZE);
+  }
+  return val;
 }
 
-static remote_code_ptr exit_ip_from_index(size_t i) {
-  return remote_code_ptr(RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * i +
-                         RR_PAGE_SYSCALL_INSTRUCTION_END);
+static int rr_page_syscall_instruction_end(SupportedArch arch) {
+  int val = 0;
+  switch (arch) {
+    case x86:
+    case x86_64:
+      val = 2;
+      break;
+    case aarch64:
+      val = 4;
+      break;
+    default:
+      FATAL() << "Syscall stub size not defined for this architecture";
+  }
+  if (arch == NativeArch::arch()) {
+    DEBUG_ASSERT(val == RR_PAGE_SYSCALL_INSTRUCTION_END);
+  }
+  return val;
+}
+
+static remote_code_ptr entry_ip_from_index(SupportedArch arch, size_t i) {
+  return remote_code_ptr(RR_PAGE_ADDR + rr_page_syscall_stub_size(arch) * i);
+}
+
+static remote_code_ptr exit_ip_from_index(SupportedArch arch, size_t i) {
+  return remote_code_ptr(RR_PAGE_ADDR + rr_page_syscall_stub_size(arch) * i +
+                         rr_page_syscall_instruction_end(arch));
 }
 
 remote_code_ptr AddressSpace::rr_page_syscall_exit_point(Traced traced,
                                                          Privileged privileged,
-                                                         Enabled enabled) {
+                                                         Enabled enabled,
+                                                         SupportedArch arch) {
   for (auto& e : entry_points) {
     if (e.traced == traced && e.privileged == privileged &&
         e.enabled == enabled) {
-      return exit_ip_from_index(&e - entry_points);
+      return exit_ip_from_index(arch, &e - entry_points);
     }
   }
   return nullptr;
@@ -381,20 +442,20 @@ remote_code_ptr AddressSpace::rr_page_syscall_exit_point(Traced traced,
 remote_code_ptr AddressSpace::rr_page_syscall_entry_point(Traced traced,
                                                           Privileged privileged,
                                                           Enabled enabled,
-                                                          SupportedArch) {
+                                                          SupportedArch arch) {
   for (auto& e : entry_points) {
     if (e.traced == traced && e.privileged == privileged &&
         e.enabled == enabled) {
-      return entry_ip_from_index(&e - entry_points);
+      return entry_ip_from_index(arch, &e - entry_points);
     }
   }
   return nullptr;
 }
 
 const AddressSpace::SyscallType* AddressSpace::rr_page_syscall_from_exit_point(
-    remote_code_ptr ip) {
+    SupportedArch arch, remote_code_ptr ip) {
   for (size_t i = 0; i < array_length(entry_points); ++i) {
-    if (exit_ip_from_index(i) == ip) {
+    if (exit_ip_from_index(arch, i) == ip) {
       return &entry_points[i];
     }
   }
@@ -402,9 +463,9 @@ const AddressSpace::SyscallType* AddressSpace::rr_page_syscall_from_exit_point(
 }
 
 const AddressSpace::SyscallType* AddressSpace::rr_page_syscall_from_entry_point(
-    remote_code_ptr ip) {
+    SupportedArch arch, remote_code_ptr ip) {
   for (size_t i = 0; i < array_length(entry_points); ++i) {
-    if (entry_ip_from_index(i) == ip) {
+    if (entry_ip_from_index(arch, i) == ip) {
       return &entry_points[i];
     }
   }
@@ -593,7 +654,7 @@ void AddressSpace::replace_breakpoints_with_original_values(
     remote_ptr<uint8_t> bkpt_location = it.first.to_data_ptr<uint8_t>();
     remote_ptr<uint8_t> start = max(addr, bkpt_location);
     remote_ptr<uint8_t> end =
-        min(addr + length, bkpt_location + it.second.data_length());
+        min(addr + length, bkpt_location + bkpt_instruction_length(arch()));
     if (start < end) {
       memcpy(dest + (start - addr),
              it.second.original_data() + (start - bkpt_location), end - start);
@@ -603,7 +664,11 @@ void AddressSpace::replace_breakpoints_with_original_values(
 
 bool AddressSpace::is_breakpoint_instruction(Task* t, remote_code_ptr ip) {
   bool ok = true;
-  return t->read_mem(ip.to_data_ptr<uint8_t>(), &ok) == breakpoint_insn && ok;
+  uint8_t data[MAX_BKPT_INSTRUCTION_LENGTH];
+  t->read_bytes_helper(ip.to_data_ptr<uint8_t>(),
+    bkpt_instruction_length(t->arch()), data, &ok);
+  return memcmp(data, breakpoint_insn(t->arch()),
+    bkpt_instruction_length(t->arch())) == 0 && ok;
 }
 
 static void remove_range(set<MemoryRange>& ranges, const MemoryRange& range) {
@@ -940,21 +1005,24 @@ void AddressSpace::remove_breakpoint(remote_code_ptr addr,
 bool AddressSpace::add_breakpoint(remote_code_ptr addr, BreakpointType type) {
   auto it = breakpoints.find(addr);
   if (it == breakpoints.end()) {
-    uint8_t overwritten_data;
+    uint8_t overwritten_data[MAX_BKPT_INSTRUCTION_LENGTH];
+    ssize_t bkpt_size = bkpt_instruction_length(arch());
     // Grab a random task from the VM so we can use its
     // read/write_mem() helpers.
     Task* t = *task_set().begin();
-    if (sizeof(overwritten_data) !=
+    if (bkpt_size !=
         t->read_bytes_fallible(addr.to_data_ptr<uint8_t>(),
-                               sizeof(overwritten_data), &overwritten_data)) {
+                               bkpt_size, overwritten_data)) {
       return false;
     }
-    t->write_mem(addr.to_data_ptr<uint8_t>(), breakpoint_insn, nullptr,
+    t->write_bytes_helper(addr.to_data_ptr<uint8_t>(), bkpt_size,
+                 breakpoint_insn(arch()), nullptr,
                  Task::IS_BREAKPOINT_RELATED);
 
     auto it_and_is_new = breakpoints.insert(make_pair(addr, Breakpoint()));
     DEBUG_ASSERT(it_and_is_new.second);
-    it_and_is_new.first->second.overwritten_data = overwritten_data;
+    memcpy(it_and_is_new.first->second.overwritten_data,
+      overwritten_data, sizeof(overwritten_data));
     it = it_and_is_new.first;
   }
   it->second.ref(type);
@@ -971,7 +1039,8 @@ void AddressSpace::suspend_breakpoint_at(remote_code_ptr addr) {
   auto it = breakpoints.find(addr);
   if (it != breakpoints.end()) {
     Task* t = *task_set().begin();
-    t->write_mem(addr.to_data_ptr<uint8_t>(), it->second.overwritten_data);
+    t->write_bytes_helper(addr.to_data_ptr<uint8_t>(),
+      bkpt_instruction_length(arch()), it->second.overwritten_data);
   }
 }
 
@@ -979,7 +1048,9 @@ void AddressSpace::restore_breakpoint_at(remote_code_ptr addr) {
   auto it = breakpoints.find(addr);
   if (it != breakpoints.end()) {
     Task* t = *task_set().begin();
-    t->write_mem(addr.to_data_ptr<uint8_t>(), breakpoint_insn);
+    t->write_bytes_helper(addr.to_data_ptr<uint8_t>(),
+      bkpt_instruction_length(arch()),
+      breakpoint_insn(arch()));
   }
 }
 
@@ -1508,6 +1579,11 @@ static void __attribute__((noinline, used)) fake_syscall() {
                        "nop\n\t"
                        "nop\n\t"
                        "nop\n\t");
+#elif defined(__aarch64__)
+  __asm__ __volatile__("rr_syscall_addr: svc #0\n\t"
+                       "nop\n\t"
+                       "nop\n\t"
+                       "nop\n\t");
 #endif
 }
 
@@ -1835,8 +1911,13 @@ void AddressSpace::destroy_breakpoint(BreakpointMap::const_iterator it) {
   Task* t = *task_set().begin();
   auto ptr = it->first.to_data_ptr<uint8_t>();
   auto data = it->second.overwritten_data;
-  LOG(debug) << "Writing back " << HEX(data) << " at " << ptr;
-  t->write_mem(ptr, data, nullptr, Task::IS_BREAKPOINT_RELATED);
+  if (bkpt_instruction_length(arch()) == 1) {
+    LOG(debug) << "Writing back " << HEX(data[0]) << " at " << ptr;
+  } else {
+    LOG(debug) << "Writing back " << bkpt_instruction_length(arch()) << " bytes at " << ptr;
+  }
+  t->write_bytes_helper(ptr, bkpt_instruction_length(arch()),
+    data, nullptr, Task::IS_BREAKPOINT_RELATED);
   breakpoints.erase(it);
 }
 
@@ -1848,9 +1929,11 @@ void AddressSpace::maybe_update_breakpoints(Task* t, remote_ptr<uint8_t> addr,
       // This breakpoint was overwritten. Note the new data and reset the
       // breakpoint.
       bool ok = true;
-      it.second.overwritten_data = t->read_mem(bp_addr, &ok);
+      t->read_bytes_helper(bp_addr, bkpt_instruction_length(arch()),
+        &it.second.overwritten_data, &ok);
       ASSERT(t, ok);
-      t->write_mem(bp_addr, breakpoint_insn);
+      t->write_bytes_helper(bp_addr, bkpt_instruction_length(arch()),
+        breakpoint_insn(arch()));
     }
   }
 }

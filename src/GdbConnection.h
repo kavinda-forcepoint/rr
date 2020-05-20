@@ -579,8 +579,9 @@ public:
   const Features& features() { return features_; }
 
   enum {
-    CPU_64BIT = 0x1,
+    CPU_X86_64 = 0x1,
     CPU_AVX = 0x2,
+    CPU_AARCH64 = 0x4
   };
   void set_cpu_features(uint32_t features) { cpu_features_ = features; }
   uint32_t cpu_features() const { return cpu_features_; }

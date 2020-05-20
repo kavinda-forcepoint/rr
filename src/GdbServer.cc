@@ -629,7 +629,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       return;
     }
     case DREQ_SET_SW_BREAK: {
-      ASSERT(target, req.watch().kind == sizeof(AddressSpace::breakpoint_insn))
+      ASSERT(target, req.watch().kind == bkpt_instruction_length(target->arch()))
           << "Debugger setting bad breakpoint insn";
       // Mirror all breakpoint/watchpoint sets/unsets to the target process
       // if it's not part of the timeline (i.e. it's a diversion).
@@ -1447,23 +1447,24 @@ static uint32_t get_cpu_features(SupportedArch arch) {
   uint32_t cpu_features;
   switch (arch) {
     case x86:
-      cpu_features = 0;
+    case x86_64: {
+      cpu_features = arch == x86_64 ? GdbConnection::CPU_X86_64 : 0;
+      unsigned int AVX_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
+      auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+      // We're assuming here that AVX support on the system making the recording
+      // is the same as the AVX support during replay. But if that's not true,
+      // rr is totally broken anyway.
+      if ((cpuid_data.ecx & AVX_cpuid_flags) == AVX_cpuid_flags) {
+        cpu_features |= GdbConnection::CPU_AVX;
+      }
       break;
-    case x86_64:
-      cpu_features = GdbConnection::CPU_64BIT;
+    }
+    case aarch64:
+      cpu_features = GdbConnection::CPU_AARCH64;
       break;
     default:
       FATAL() << "Unknown architecture";
       return 0;
-  }
-
-  unsigned int AVX_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
-  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
-  // We're assuming here that AVX support on the system making the recording
-  // is the same as the AVX support during replay. But if that's not true,
-  // rr is totally broken anyway.
-  if ((cpuid_data.ecx & AVX_cpuid_flags) == AVX_cpuid_flags) {
-    cpu_features |= GdbConnection::CPU_AVX;
   }
 
   return cpu_features;

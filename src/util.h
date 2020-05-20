@@ -16,6 +16,7 @@
 #include "ScopedFd.h"
 #include "TraceFrame.h"
 #include "remote_ptr.h"
+#include "kernel_supplement.h"
 
 /* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
  * power failure, and it's unlikely rr will be recording that.
@@ -37,6 +38,7 @@ struct Event;
 class KernelMapping;
 class Task;
 class TraceFrame;
+class RecordTask;
 
 enum Completion { COMPLETE, INCOMPLETE };
 
@@ -49,6 +51,8 @@ std::vector<uint8_t> read_auxv(Task* t);
  * Returns a vector containing the environment strings.
  */
 std::vector<std::string> read_env(Task* t);
+
+void patch_auxv_vdso(RecordTask* t);
 
 /**
  * Create a file named |filename| and dump |buf_len| words in |buf| to

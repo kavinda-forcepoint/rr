@@ -1,9 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "Task.h"
-
-#include <asm/prctl.h>
-#include <asm/ptrace.h>
 #include <elf.h>
 #include <errno.h>
 #include <limits.h>
@@ -32,6 +28,8 @@
 #include <sstream>
 
 #include <rr/rr.h>
+
+#include "Task.h"
 
 #include "preload/preload_interface.h"
 
@@ -161,7 +159,15 @@ void Task::wait_exit() {
    */
   int ret = waitid(P_PID, tid, &info, WSTOPPED | WNOWAIT);
   if (ret == 0) {
-    DEBUG_ASSERT(info.si_pid == tid && WaitStatus(info).ptrace_event() == PTRACE_EVENT_EXEC);
+    DEBUG_ASSERT(info.si_pid == tid);
+    if (WaitStatus(info).ptrace_event() == PTRACE_EVENT_EXIT) {
+      // It's possible that the earlier exit event was synthetic, in which
+      // case we're only now catching up to the real process exit. In that
+      // case, just ask the process to actually exit. (TODO: We may want to
+      // catch this earlier).
+      return proceed_to_exit(true);
+    }
+    DEBUG_ASSERT(WaitStatus(info).ptrace_event() == PTRACE_EVENT_EXEC);
     // The kernel will do the reaping for us in this case
     was_reaped = true;
   } else {
@@ -455,6 +461,62 @@ static void process_shmdt(Task* t, remote_ptr<void> addr) {
 }
 
 template <typename Arch>
+static void ptrace_syscall_exit_legacy_arch(Task* t, Task* tracee, const Registers& regs)
+{
+  switch ((int)regs.orig_arg1_signed()) {
+    case Arch::PTRACE_SETREGS: {
+      auto data = t->read_mem(
+          remote_ptr<typename Arch::user_regs_struct>(regs.arg4()));
+      Registers r = tracee->regs();
+      r.set_from_ptrace_for_arch(Arch::arch(), &data, sizeof(data));
+      tracee->set_regs(r);
+      break;
+    }
+    case Arch::PTRACE_SETFPREGS: {
+      auto data = t->read_mem(
+          remote_ptr<typename Arch::user_fpregs_struct>(regs.arg4()));
+      auto r = tracee->extra_regs();
+      r.set_user_fpregs_struct(t, Arch::arch(), &data, sizeof(data));
+      tracee->set_extra_regs(r);
+      break;
+    }
+    case Arch::PTRACE_SETFPXREGS: {
+      auto data =
+          t->read_mem(remote_ptr<X86Arch::user_fpxregs_struct>(regs.arg4()));
+      auto r = tracee->extra_regs();
+      r.set_user_fpxregs_struct(t, data);
+      tracee->set_extra_regs(r);
+      break;
+    }
+    case Arch::PTRACE_POKEUSR: {
+      size_t addr = regs.arg3();
+      typename Arch::unsigned_word data = regs.arg4();
+      if (addr < sizeof(typename Arch::user_regs_struct)) {
+        Registers r = tracee->regs();
+        r.write_register_by_user_offset(addr, data);
+        tracee->set_regs(r);
+      } else if (addr >= offsetof(typename Arch::user, u_debugreg[0]) &&
+                  addr < offsetof(typename Arch::user, u_debugreg[8])) {
+        size_t regno =
+            (addr - offsetof(typename Arch::user, u_debugreg[0])) /
+            sizeof(data);
+        tracee->set_debug_reg(regno, data);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+template <>
+void ptrace_syscall_exit_legacy_arch<ARM64Arch>(Task*, Task*, const Registers&)
+{
+  // Nothing to do - unimplemented on this architecture
+  return;
+}
+
+template <typename Arch>
 void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
   session().accumulate_syscall_performed();
 
@@ -469,7 +531,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     // replay is notified of the syscall via the `mprotect_records`
     // mechanism; if it's being recorded, it forwards that notification to
     // the recorder by calling this syscall.
-    pid_t tid = regs.arg1();
+    pid_t tid = regs.orig_arg1();
     remote_ptr<void> addr = regs.arg2();
     size_t num_bytes = regs.arg3();
     int prot = regs.arg4_signed();
@@ -497,26 +559,26 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     }
 
     case Arch::mprotect: {
-      remote_ptr<void> addr = regs.arg1();
+      remote_ptr<void> addr = regs.orig_arg1();
       size_t num_bytes = regs.arg2();
       int prot = regs.arg3_signed();
       return vm()->protect(this, addr, num_bytes, prot);
     }
     case Arch::munmap: {
-      remote_ptr<void> addr = regs.arg1();
+      remote_ptr<void> addr = regs.orig_arg1();
       size_t num_bytes = regs.arg2();
       return vm()->unmap(this, addr, num_bytes);
     }
     case Arch::shmdt:
-      return process_shmdt(this, regs.arg1());
+      return process_shmdt(this, regs.orig_arg1());
     case Arch::madvise: {
-      remote_ptr<void> addr = regs.arg1();
+      remote_ptr<void> addr = regs.orig_arg1();
       size_t num_bytes = regs.arg2();
       int advice = regs.arg3();
       return vm()->advise(this, addr, num_bytes, advice);
     }
     case Arch::ipc: {
-      switch ((int)regs.arg1_signed()) {
+      switch ((int)regs.orig_arg1_signed()) {
         case SHMDT:
           return process_shmdt(this, regs.arg5());
         default:
@@ -526,11 +588,11 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     }
 
     case Arch::set_thread_area:
-      set_thread_area(regs.arg1());
+      set_thread_area(regs.orig_arg1());
       return;
 
     case Arch::prctl:
-      switch ((int)regs.arg1_signed()) {
+      switch ((int)regs.orig_arg1_signed()) {
         case PR_SET_SECCOMP:
           if (regs.arg2() == SECCOMP_MODE_FILTER && session().is_recording()) {
             seccomp_bpf_enabled = true;
@@ -546,20 +608,20 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     case Arch::dup:
     case Arch::dup2:
     case Arch::dup3:
-      fd_table()->did_dup(regs.arg1(), regs.syscall_result());
+      fd_table()->did_dup(regs.orig_arg1(), regs.syscall_result());
       return;
     case Arch::fcntl64:
     case Arch::fcntl:
       if (regs.arg2() == Arch::DUPFD || regs.arg2() == Arch::DUPFD_CLOEXEC) {
-        fd_table()->did_dup(regs.arg1(), regs.syscall_result());
+        fd_table()->did_dup(regs.orig_arg1(), regs.syscall_result());
       }
       return;
     case Arch::close:
-      fd_table()->did_close(regs.arg1());
+      fd_table()->did_close(regs.orig_arg1());
       return;
 
     case Arch::unshare:
-      if (regs.arg1() & CLONE_FILES) {
+      if (regs.orig_arg1() & CLONE_FILES) {
         fds->erase_task(this);
         fds = fds->clone(this);
       }
@@ -567,7 +629,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
 
     case Arch::pwrite64:
     case Arch::write: {
-      int fd = (int)regs.arg1_signed();
+      int fd = (int)regs.orig_arg1_signed();
       vector<FileMonitor::Range> ranges;
       ssize_t amount = regs.syscall_result_signed();
       if (amount > 0) {
@@ -580,7 +642,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
 
     case Arch::pwritev:
     case Arch::writev: {
-      int fd = (int)regs.arg1_signed();
+      int fd = (int)regs.orig_arg1_signed();
       vector<FileMonitor::Range> ranges;
       auto iovecs =
           read_mem(remote_ptr<typename Arch::iovec>(regs.arg2()), regs.arg3());
@@ -601,31 +663,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     case Arch::ptrace: {
       pid_t pid = (pid_t)regs.arg2_signed();
       Task* tracee = session().find_task(pid);
-      switch ((int)regs.arg1_signed()) {
-        case PTRACE_SETREGS: {
-          auto data = read_mem(
-              remote_ptr<typename Arch::user_regs_struct>(regs.arg4()));
-          Registers r = tracee->regs();
-          r.set_from_ptrace_for_arch(Arch::arch(), &data, sizeof(data));
-          tracee->set_regs(r);
-          break;
-        }
-        case PTRACE_SETFPREGS: {
-          auto data = read_mem(
-              remote_ptr<typename Arch::user_fpregs_struct>(regs.arg4()));
-          auto r = extra_regs();
-          r.set_user_fpregs_struct(this, Arch::arch(), &data, sizeof(data));
-          set_extra_regs(r);
-          break;
-        }
-        case PTRACE_SETFPXREGS: {
-          auto data =
-              read_mem(remote_ptr<X86Arch::user_fpxregs_struct>(regs.arg4()));
-          auto r = extra_regs();
-          r.set_user_fpxregs_struct(this, data);
-          set_extra_regs(r);
-          break;
-        }
+      switch ((int)regs.orig_arg1_signed()) {
         case PTRACE_SETREGSET: {
           switch ((int)regs.arg3()) {
             case NT_PRSTATUS: {
@@ -680,23 +718,10 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
           }
           break;
         }
-        case PTRACE_POKEUSER: {
-          size_t addr = regs.arg3();
-          typename Arch::unsigned_word data = regs.arg4();
-          if (addr < sizeof(typename Arch::user_regs_struct)) {
-            Registers r = tracee->regs();
-            r.write_register_by_user_offset(addr, data);
-            tracee->set_regs(r);
-          } else if (addr >= offsetof(typename Arch::user, u_debugreg[0]) &&
-                     addr < offsetof(typename Arch::user, u_debugreg[8])) {
-            size_t regno =
-                (addr - offsetof(typename Arch::user, u_debugreg[0])) /
-                sizeof(data);
-            tracee->set_debug_reg(regno, data);
+        case Arch::PTRACE_ARCH_PRCTL: {
+          if (tracee->arch() != x86_64) {
+            break;
           }
-          break;
-        }
-        case PTRACE_ARCH_PRCTL: {
           int code = (int)regs.arg4();
           switch (code) {
             case ARCH_GET_FS:
@@ -722,6 +747,13 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
             default:
               ASSERT(tracee, 0) << "Should have detected this earlier";
           }
+          break;
+        }
+        case Arch::PTRACE_SETREGS:
+        case Arch::PTRACE_SETFPREGS:
+        case Arch::PTRACE_SETFPXREGS:
+        case Arch::PTRACE_POKEUSR: {
+          ptrace_syscall_exit_legacy_arch<Arch>(this, tracee, regs);
         }
       }
       return;
@@ -953,6 +985,7 @@ const Registers& Task::regs() const {
 
 const ExtraRegisters& Task::extra_regs() {
   if (!extra_registers_known) {
+#if defined(__i386__) || defined(__x86_64__)
     if (xsave_area_size() > 512) {
       LOG(debug) << "  (refreshing extra-register cache using XSAVE)";
 
@@ -979,24 +1012,68 @@ const ExtraRegisters& Task::extra_regs() {
       extra_registers.format_ = ExtraRegisters::XSAVE;
       extra_registers.data_.resize(sizeof(user_fpregs_struct));
       xptrace(PTRACE_GETFPREGS, nullptr, extra_registers.data_.data());
+#endif
+    }
+#elif defined(__aarch64__)
+    LOG(debug) << "  (refreshing extra-register cache using FPR)";
+
+    extra_registers.format_ = ExtraRegisters::NT_FPR;
+    extra_registers.data_.resize(sizeof(ARM64Arch::user_fpregs_struct));
+    struct iovec vec = { extra_registers.data_.data(),
+                          extra_registers.data_.size() };
+    xptrace(PTRACE_GETREGSET, NT_PRFPREG, &vec);
+    extra_registers.data_.resize(vec.iov_len);
 #else
 #error need to define new extra_regs support
 #endif
-    }
 
     extra_registers_known = true;
   }
   return extra_registers;
 }
 
+#if defined(__i386__) || defined(__x86_64__)
 static ssize_t dr_user_word_offset(size_t i) {
   DEBUG_ASSERT(i < NUM_X86_DEBUG_REGS);
   return offsetof(struct user, u_debugreg[0]) + sizeof(void*) * i;
 }
 
+uintptr_t Task::get_debug_reg(size_t regno) {
+  errno = 0;
+  long result =
+      fallible_ptrace(PTRACE_PEEKUSER, dr_user_word_offset(regno), nullptr);
+  if (errno == ESRCH) {
+    return 0;
+  }
+  return result;
+}
+
+bool Task::set_debug_reg(size_t regno, uintptr_t value) {
+  errno = 0;
+  fallible_ptrace(PTRACE_POKEUSER, dr_user_word_offset(regno), (void*)value);
+  return errno == ESRCH || errno == 0;
+}
+
 uintptr_t Task::debug_status() {
   return fallible_ptrace(PTRACE_PEEKUSER, dr_user_word_offset(6), nullptr);
 }
+#else
+#define FATAL_X86_ONLY() FATAL() << "Reached x86-only code path on non-x86 architecture";
+uintptr_t Task::get_debug_reg(size_t) {
+  FATAL_X86_ONLY();
+  return 0;
+}
+
+bool Task::set_debug_reg(size_t, uintptr_t) {
+  FATAL_X86_ONLY();
+  return false;
+}
+
+uintptr_t Task::debug_status() {
+  FATAL_X86_ONLY();
+  return 0;
+}
+#endif
 
 void Task::set_debug_status(uintptr_t status) {
   set_debug_reg(6, status);
@@ -1194,7 +1271,7 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
   }
 
   LOG(debug) << "resuming execution of " << tid << " with "
-             << ptrace_req_name(how)
+             << ptrace_req_name<NativeArch>(how)
              << (sig ? string(", signal ") + signal_name(sig) : string())
              << " tick_period " << tick_period << " wait " << wait_how;
   address_of_last_execution_resume = ip();
@@ -1244,7 +1321,7 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
           << "waitpid(" << tid << ", NOHANG) failed with " << wait_ret;
     }
   }
-  if (wait_ret > 0) {
+  if (wait_ret > 0 || seen_ptrace_exit_event) {
     LOG(debug) << "Task " << tid << " exited unexpectedly";
     // wait() will see this and report the ptrace-exit event.
     detected_unexpected_exit = true;
@@ -1301,10 +1378,14 @@ void Task::set_extra_regs(const ExtraRegisters& regs) {
                extra_registers.data_.size() == sizeof(user_fpregs_struct));
         ptrace_if_alive(PTRACE_SETFPREGS, nullptr,
                         extra_registers.data_.data());
-#else
-#error Unsupported architecture
 #endif
       }
+      break;
+    }
+    case ExtraRegisters::NT_FPR: {
+      struct iovec vec = { extra_registers.data_.data(),
+                            extra_registers.data_.size() };
+      ptrace_if_alive(PTRACE_SETREGSET, NT_PRFPREG, &vec);
       break;
     }
     default:
@@ -1417,24 +1498,8 @@ bool Task::set_debug_regs(const DebugRegs& regs) {
   return set_debug_reg(7, dr7.packed);
 }
 
-uintptr_t Task::get_debug_reg(size_t regno) {
-  errno = 0;
-  long result =
-      fallible_ptrace(PTRACE_PEEKUSER, dr_user_word_offset(regno), nullptr);
-  if (errno == ESRCH) {
-    return 0;
-  }
-  return result;
-}
-
-bool Task::set_debug_reg(size_t regno, uintptr_t value) {
-  errno = 0;
-  fallible_ptrace(PTRACE_POKEUSER, dr_user_word_offset(regno), (void*)value);
-  return errno == ESRCH || errno == 0;
-}
-
-static void set_thread_area(std::vector<struct user_desc>& thread_areas_,
-                            user_desc desc) {
+static void set_thread_area(std::vector<X86Arch::user_desc>& thread_areas_,
+                            X86Arch::user_desc desc) {
   for (auto& t : thread_areas_) {
     if (t.entry_number == desc.entry_number) {
       t = desc;
@@ -1444,13 +1509,15 @@ static void set_thread_area(std::vector<struct user_desc>& thread_areas_,
   thread_areas_.push_back(desc);
 }
 
-void Task::set_thread_area(remote_ptr<struct user_desc> tls) {
+void Task::set_thread_area(remote_ptr<X86Arch::user_desc> tls) {
   // We rely on the fact that user_desc is word-size-independent.
+  DEBUG_ASSERT(arch() == x86 || arch() == x86_64);
   auto desc = read_mem(tls);
   rr::set_thread_area(thread_areas_, desc);
 }
 
-int Task::emulate_set_thread_area(int idx, struct ::user_desc desc) {
+int Task::emulate_set_thread_area(int idx, X86Arch::user_desc desc) {
+  DEBUG_ASSERT(arch() == x86 || arch() == x86_64);
   errno = 0;
   fallible_ptrace(PTRACE_SET_THREAD_AREA, idx, &desc);
   if (errno != 0) {
@@ -1461,7 +1528,8 @@ int Task::emulate_set_thread_area(int idx, struct ::user_desc desc) {
   return 0;
 }
 
-int Task::emulate_get_thread_area(int idx, struct ::user_desc& desc) {
+int Task::emulate_get_thread_area(int idx, X86Arch::user_desc& desc) {
+  DEBUG_ASSERT(arch() == x86 || arch() == x86_64);
   LOG(debug) << "Emulating PTRACE_GET_THREAD_AREA";
   errno = 0;
   fallible_ptrace(PTRACE_GET_THREAD_AREA, idx, &desc);
@@ -1725,7 +1793,7 @@ void Task::did_waitpid(WaitStatus status) {
     // task's register values are not what they should be.
     if (!is_stopped && !registers_dirty) {
       LOG(debug) << "Requesting registers from tracee " << tid;
-      struct user_regs_struct ptrace_regs;
+      NativeArch::user_regs_struct ptrace_regs;
       if (ptrace_if_alive(PTRACE_GETREGS, nullptr, &ptrace_regs)) {
         registers.set_from_ptrace(ptrace_regs);
   #if defined(__i386__) || defined(__x86_64__)
@@ -1877,7 +1945,7 @@ bool Task::try_wait() {
 template <typename Arch>
 static void set_thread_area_from_clone_arch(Task* t, remote_ptr<void> tls) {
   if (Arch::clone_tls_type == Arch::UserDescPointer) {
-    t->set_thread_area(tls.cast<struct user_desc>());
+    t->set_thread_area(tls.cast<X86Arch::user_desc>());
   }
 }
 
@@ -2566,7 +2634,7 @@ const TraceStream* Task::trace_stream() const {
 void Task::xptrace(int request, remote_ptr<void> addr, void* data) {
   errno = 0;
   fallible_ptrace(request, addr, data);
-  ASSERT(this, !errno) << "ptrace(" << ptrace_req_name(request) << ", " << tid
+  ASSERT(this, !errno) << "ptrace(" << ptrace_req_name<NativeArch>(request) << ", " << tid
                        << ", addr=" << addr << ", data=" << data
                        << ") failed with errno " << errno;
 }
@@ -2578,7 +2646,7 @@ bool Task::ptrace_if_alive(int request, remote_ptr<void> addr, void* data) {
     LOG(debug) << "ptrace_if_alive tid " << tid << " was not alive";
     return false;
   }
-  ASSERT(this, !errno) << "ptrace(" << ptrace_req_name(request) << ", " << tid
+  ASSERT(this, !errno) << "ptrace(" << ptrace_req_name<NativeArch>(request) << ", " << tid
                        << ", addr=" << addr << ", data=" << data
                        << ") failed with errno " << errno;
   return true;
@@ -2705,6 +2773,24 @@ static void spawned_child_fatal_error(const ScopedFd& err_fd,
   _exit(1);
 }
 
+static void disable_tsc(int err_fd) {
+  /* Trap to the rr process if a 'rdtsc' instruction is issued.
+   * That allows rr to record the tsc and replay it
+   * deterministically. */
+  if (0 > prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0)) {
+    spawned_child_fatal_error(err_fd, "error setting up prctl");
+  }
+}
+
+template <typename Arch> void set_up_process_arch(int err_fd);
+template <> void set_up_process_arch<X86Arch>(int err_fd) { disable_tsc(err_fd); }
+template <> void set_up_process_arch<X64Arch>(int err_fd) { disable_tsc(err_fd); }
+template <> void set_up_process_arch<ARM64Arch>(int) {}
+
+void set_up_process_arch(SupportedArch arch, int err_fd) {
+  RR_ARCH_FUNCTION(set_up_process_arch, arch, err_fd);
+}
+
 /**
  * Prepare this process and its ancestors for recording/replay by
  * preventing direct access to sources of nondeterminism, and ensuring
@@ -2754,12 +2840,9 @@ static void set_up_process(Session& session, const ScopedFd& err_fd,
     setsid();
   }
 
-  /* Trap to the rr process if a 'rdtsc' instruction is issued.
-   * That allows rr to record the tsc and replay it
-   * deterministically. */
-  if (0 > prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0)) {
-    spawned_child_fatal_error(err_fd, "error setting up prctl");
-  }
+  /* Do any architecture specific setup, such as disabling non-deterministic
+     instructions */
+  set_up_process_arch(NativeArch::arch(), err_fd);
 
   /* If we're in setuid_sudo mode, we have CAP_SYS_ADMIN, so we don't need to
      set NO_NEW_PRIVS here in order to install the seccomp filter later. In,
@@ -2780,7 +2863,8 @@ static SeccompFilter<struct sock_filter> create_seccomp_filter() {
   for (auto& e : AddressSpace::rr_page_syscalls()) {
     if (e.traced == AddressSpace::UNTRACED) {
       auto ip = AddressSpace::rr_page_syscall_exit_point(e.traced, e.privileged,
-                                                         e.enabled);
+                                                         e.enabled,
+                                                         NativeArch::arch());
       f.allow_syscalls_from_callsite(ip);
     }
   }

@@ -345,6 +345,15 @@ bool patch_syscall_with_hook_arch<X64Arch>(Monkeypatcher& patcher,
                                                                     hook);
 }
 
+template <>
+bool patch_syscall_with_hook_arch<ARM64Arch>(Monkeypatcher&,
+                                             RecordTask*,
+                                             const syscall_patch_hook&) {
+  FATAL() << "Unimplemented";
+  return false;
+}
+
+
 static bool patch_syscall_with_hook(Monkeypatcher& patcher, RecordTask* t,
                                     const syscall_patch_hook& hook) {
   RR_ARCH_FUNCTION(patch_syscall_with_hook_arch, t->arch(), patcher, t, hook);
@@ -723,6 +732,11 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X86Arch>(t);
   setup_audit_library_path<X86Arch>(t);
 
+  if (!t->vm()->has_vdso()) {
+    patch_auxv_vdso(t);
+    return;
+  }
+
   VdsoReader reader(t);
   auto syms = reader.read_symbols(".dynsym", ".dynstr");
   patcher.x86_vsyscall = locate_and_verify_kernel_vsyscall(t, reader, syms);
@@ -845,6 +859,18 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X64Arch>(t);
   setup_audit_library_path<X64Arch>(t);
 
+  for (const auto& m : t->vm()->maps()) {
+    auto& km = m.map;
+    patcher.patch_after_mmap(t, km.start(), km.size(),
+                             km.file_offset_bytes()/page_size(), -1,
+                             Monkeypatcher::MMAP_EXEC);
+  }
+
+  if (!t->vm()->has_vdso()) {
+    patch_auxv_vdso(t);
+    return;
+  }
+
   auto vdso_start = t->vm()->vdso().start();
   size_t vdso_size = t->vm()->vdso().size();
 
@@ -908,13 +934,11 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   }
 
   obliterate_debug_info(t, reader);
+}
 
-  for (const auto& m : t->vm()->maps()) {
-    auto& km = m.map;
-    patcher.patch_after_mmap(t, km.start(), km.size(),
-                             km.file_offset_bytes()/page_size(), -1,
-                             Monkeypatcher::MMAP_EXEC);
-  }
+template <>
+void patch_after_exec_arch<ARM64Arch>(RecordTask*, Monkeypatcher&) {
+  FATAL() << "Unimplemented";
 }
 
 template <>
@@ -928,6 +952,17 @@ void patch_at_preload_init_arch<X64Arch>(RecordTask* t,
 
   patcher.init_dynamic_syscall_patching(t, params.syscall_patch_hook_count,
                                         params.syscall_patch_hooks);
+}
+
+template <>
+void patch_at_preload_init_arch<ARM64Arch>(RecordTask* t,
+                                           Monkeypatcher&) {
+  auto params = t->read_mem(
+      remote_ptr<rrcall_init_preload_params<ARM64Arch>>(t->regs().arg1()));
+  if (!params.syscallbuf_enabled) {
+    return;
+  }
+  FATAL() << "Unimplemented";
 }
 
 void Monkeypatcher::patch_after_exec(RecordTask* t) {

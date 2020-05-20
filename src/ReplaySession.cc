@@ -68,7 +68,7 @@ ReplaySession::MemoryRanges ReplaySession::always_free_address_space(
   // Assume 64-bit address spaces with the 47-bit user-space limitation,
   // for now.
   remote_ptr<void> addressable_max = uintptr_t(
-      sizeof(void*) == 8 ? uint64_t(1) << 47 : (uint64_t(1) << 32) - PAGE_SIZE);
+      sizeof(void*) == 8 ? uint64_t(1) << 47 : (uint64_t(1) << 32) - page_size());
   result.insert(MemoryRange(addressable_min, addressable_max));
   TraceReader tmp_reader(reader);
   bool found;
@@ -171,23 +171,26 @@ ReplaySession::ReplaySession(const std::string& dir, const Flags& flags)
 
   trace_start_time = trace_frame.monotonic_time();
 
-  if (trace_in.uses_cpuid_faulting() && !has_cpuid_faulting()) {
-    CLEAN_FATAL()
-        << "Trace was recorded with CPUID faulting enabled, but this\n"
-           "system does not support CPUID faulting.";
-  }
-  if (!has_cpuid_faulting() && !cpuid_compatible(trace_in.cpuid_records())) {
-    CLEAN_FATAL()
-        << "Trace was recorded on a machine with different CPUID values\n"
-           "and CPUID faulting is not enabled; replay will not work.";
-  }
   if (!PerfCounters::supports_ticks_semantics(ticks_semantics_)) {
     CLEAN_FATAL()
         << "Trace was recorded on a machine that defines ticks differently\n"
            "to this machine; replay will not work.";
   }
 
-  check_xsave_compatibility(trace_in);
+  if (trace_in.arch() == x86 || trace_in.arch() == x86_64) {
+    if (trace_in.uses_cpuid_faulting() && !has_cpuid_faulting()) {
+      CLEAN_FATAL()
+          << "Trace was recorded with CPUID faulting enabled, but this\n"
+            "system does not support CPUID faulting.";
+    }
+    if (!has_cpuid_faulting() && !cpuid_compatible(trace_in.cpuid_records())) {
+      CLEAN_FATAL()
+          << "Trace was recorded on a machine with different CPUID values\n"
+            "and CPUID faulting is not enabled; replay will not work.";
+    }
+
+    check_xsave_compatibility(trace_in);
+  }
 }
 
 ReplaySession::ReplaySession(const ReplaySession& other)
@@ -491,7 +494,7 @@ Completion ReplaySession::cont_syscall_boundary(
     t->resume_execution(RESUME_SYSEMU, RESUME_WAIT, ticks_request);
   }
 
-  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->ip());
+  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
   if (type && type->traced == AddressSpace::UNTRACED &&
       type->enabled == AddressSpace::REPLAY_ONLY) {
     // Actually perform it. We can hit these when replaying through syscallbuf
@@ -562,7 +565,10 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
         r.set_ip(
             syscall_instruction.increment_by_syscall_insn_length(t->arch()));
         r.set_original_syscallno(r.syscallno());
-        r.set_syscall_result(-ENOSYS);
+        r.set_orig_arg1(r.arg1());
+        if (t->arch() == x86 || t->arch() == x86_64) {
+          r.set_syscall_result(-ENOSYS);
+        }
         t->set_regs(r);
         t->canonicalize_regs(current_trace_frame().event().Syscall().arch());
         t->validate_regs();
@@ -647,7 +653,7 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
   } else {
     t->resume_execution(resume_how, RESUME_WAIT, tick_request);
     if (t->stop_sig() == 0) {
-      auto type = AddressSpace::rr_page_syscall_from_exit_point(t->ip());
+      auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
       if (type && type->traced == AddressSpace::UNTRACED) {
         // If we recorded an rr replay of an application doing a
         // syscall-buffered 'mprotect', the replay's `flush_syscallbuf`
@@ -1481,6 +1487,7 @@ ReplayTask* ReplaySession::revive_task_for_exec() {
              << trace_frame.tid();
   task_map.erase(t->rec_tid);
   t->rec_tid = trace_frame.tid();
+  t->serial = next_task_serial();
   task_map.insert(make_pair(t->rec_tid, t));
   // The real tid is not changing yet. It will, in process_execve.
   return t;

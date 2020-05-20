@@ -1,8 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "replay_syscall.h"
-
-#include <asm/prctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
@@ -24,6 +21,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+
+#include "replay_syscall.h"
 
 #include "preload/preload_interface.h"
 
@@ -931,8 +930,8 @@ static void rep_after_enter_syscall_arch(ReplayTask* t) {
         }
         case PTRACE_SET_THREAD_AREA: {
           bool ok = true;
-          struct ::user_desc desc = t->read_mem(
-              remote_ptr<struct ::user_desc>(t->regs().arg4()), &ok);
+          X86Arch::user_desc desc = t->read_mem(
+              remote_ptr<X86Arch::user_desc>(t->regs().arg4()), &ok);
           if (ok) {
             target->emulate_set_thread_area((int)t->regs().arg3(), desc);
           }

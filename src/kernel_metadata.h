@@ -13,6 +13,11 @@
 namespace rr {
 
 /**
+ * Return the symbolic name of the architecture `arch`.
+ */
+std::string arch_name(SupportedArch arch);
+
+/**
  * Return the symbolic name of |syscall|, f.e. "read", or "syscall(%d)"
  * if unknown.
  */
@@ -28,6 +33,7 @@ std::string ptrace_event_name(int event);
  * Return the symbolic name of the PTRACE_ |request|, or "PTRACE_REQUEST(%d)" if
  * unknown.
  */
+template <typename Arch>
 std::string ptrace_req_name(int request);
 
 /**

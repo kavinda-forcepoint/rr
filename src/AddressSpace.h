@@ -621,6 +621,7 @@ public:
 
   /** Return the vdso mapping of this. */
   KernelMapping vdso() const;
+  bool has_vdso() const { return has_mapping(vdso_start_addr); }
 
   /**
    * Verify that this cached address space matches what the
@@ -630,9 +631,6 @@ public:
 
   bool has_breakpoints() { return !breakpoints.empty(); }
   bool has_watchpoints() { return !watchpoints.empty(); }
-
-  // Encoding of the |int $3| instruction.
-  static const uint8_t breakpoint_insn = 0xCC;
 
   ScopedFd& mem_fd() { return child_mem_fd; }
   void set_mem_fd(ScopedFd&& fd) { child_mem_fd = std::move(fd); }
@@ -670,7 +668,7 @@ public:
   }
 
   static remote_ptr<void> preload_thread_locals_start() {
-    return rr_page_start() + PAGE_SIZE;
+    return rr_page_start() + rr_page_size();
   }
   static uint32_t preload_thread_locals_size() {
     return PRELOAD_THREAD_LOCALS_SIZE;
@@ -681,7 +679,8 @@ public:
   enum Enabled { RECORDING_ONLY, REPLAY_ONLY, RECORDING_AND_REPLAY };
   static remote_code_ptr rr_page_syscall_exit_point(Traced traced,
                                                     Privileged privileged,
-                                                    Enabled enabled);
+                                                    Enabled enabled,
+                                                    SupportedArch arch);
   static remote_code_ptr rr_page_syscall_entry_point(Traced traced,
                                                      Privileged privileged,
                                                      Enabled enabled,
@@ -693,9 +692,10 @@ public:
     Enabled enabled;
   };
   static std::vector<SyscallType> rr_page_syscalls();
-  static const SyscallType* rr_page_syscall_from_exit_point(remote_code_ptr ip);
+  static const SyscallType* rr_page_syscall_from_exit_point(
+    SupportedArch arch, remote_code_ptr ip);
   static const SyscallType* rr_page_syscall_from_entry_point(
-      remote_code_ptr ip);
+    SupportedArch arch, remote_code_ptr ip);
 
   /**
    * Return a pointer to 8 bytes of 0xFF
@@ -935,18 +935,14 @@ private:
       return user_count > 0 ? BKPT_USER : BKPT_INTERNAL;
     }
 
-    size_t data_length() { return 1; }
-    uint8_t* original_data() { return &overwritten_data; }
+    uint8_t* original_data() { return overwritten_data; }
 
     // "Refcounts" of breakpoints set at |addr|.  The breakpoint
     // object must be unique since we have to save the overwritten
     // data, and we can't enforce the order in which breakpoints
     // are set/removed.
     int internal_count, user_count;
-    uint8_t overwritten_data;
-    static_assert(sizeof(overwritten_data) ==
-                      sizeof(AddressSpace::breakpoint_insn),
-                  "Must have the same size.");
+    uint8_t overwritten_data[MAX_BKPT_INSTRUCTION_LENGTH];
 
     int* counter(BreakpointType which) {
       DEBUG_ASSERT(BKPT_INTERNAL == which || BKPT_USER == which);

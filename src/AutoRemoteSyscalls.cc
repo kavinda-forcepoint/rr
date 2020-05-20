@@ -556,7 +556,10 @@ int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
   }
 }
 
-void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno) {
+void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno, bool allow_death) {
+  if (allow_death && ret == -ESRCH) {
+    return;
+  }
   if (-4096 < ret && ret < 0) {
     string extra_msg;
     if (is_open_syscall(syscallno, arch())) {
@@ -588,7 +591,7 @@ void AutoRemoteSyscalls::finish_direct_mmap(
    * recording. */
   {
     AutoRestoreMem child_str(*this, backing_file_name.c_str());
-    fd = infallible_syscall(syscall_number_for_open(arch()),
+    fd = infallible_syscall(syscall_number_for_openat(arch()), -1,
                             child_str.get().as_int(),
                             backing_file_open_flags);
   }

@@ -358,8 +358,10 @@ set(GENERATED_FILES
   CheckSyscallNumbers.generated
   SyscallEnumsX64.generated
   SyscallEnumsX86.generated
+  SyscallEnumsGeneric.generated
   SyscallEnumsForTestsX64.generated
   SyscallEnumsForTestsX86.generated
+  SyscallEnumsForTestsGeneric.generated
   SyscallHelperFunctions.generated
   SyscallnameArch.generated
   SyscallRecordCase.generated
@@ -386,6 +388,10 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
                    "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64"
+                   COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
+                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64"
+                   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
                    "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay"
@@ -394,12 +400,18 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_repla
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
                    "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64_replay"
+                   COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
+                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64_replay"
+                   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 
 add_custom_target(Pages DEPENDS
                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32"
                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64"
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64"
                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay"
-                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay")
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay"
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64_replay")
 
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++"
                           "${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.h"
@@ -488,7 +500,7 @@ set(RR_SOURCES
   src/util.cc
   src/WaitStatus.cc
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
-  third-party/blake2/blake2b.c
+  third-party/blake2/sse/blake2b.c
 )
 
 set_source_files_properties(${RR_SOURCES}
@@ -585,6 +597,9 @@ set(RR_GDB_RESOURCES
   amd64-linux.xml
   i386-avx-linux.xml
   i386-linux.xml
+  aarch64-core.xml
+  aarch64-fpu.xml
+  aarch64-pauth.xml
 )
 foreach(file ${RR_GDB_RESOURCES})
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/third-party/gdb/${file}"
@@ -612,6 +627,8 @@ install(PROGRAMS scripts/signal-rr-recording.sh
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64
               ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay
+              ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64
+              ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_arm64_replay
               ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32
               ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay
   DESTINATION ${CMAKE_INSTALL_DATADIR}/rr)
@@ -1334,6 +1351,7 @@ set(TESTS_WITHOUT_PROGRAM
   syscallbuf_timeslice_250
   trace_version
   term_trace_cpu
+  unmap_vdso
   unwind_on_signal
   vfork_exec
   vfork_break_parent

@@ -6,7 +6,6 @@
 
 // Get all the kernel definitions so we can verify our alternative versions.
 #include <arpa/inet.h>
-#include <asm/ldt.h>
 #include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
@@ -49,6 +48,12 @@
 #include <sys/vfs.h>
 #include <termios.h>
 
+// x86_only
+#if defined(__i386__) || defined(__x86_64__)
+#include <asm/prctl.h>
+#include <asm/ldt.h>
+#endif
+
 // Used to verify definitions in kernel_abi.h
 namespace rr {
 #define RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_)                     \
@@ -61,6 +66,11 @@ namespace rr {
 
 // For instances where the system type and the rr type are named identically.
 #define RR_VERIFY_TYPE(type_) RR_VERIFY_TYPE_EXPLICIT(::type_, type_)
+
+#if defined(__i386__) || defined(__x86_64__)
+#define RR_VERIFY_TYPE_X86(type_) RR_VERIFY_TYPE(type_)
+#define RR_VERIFY_TYPE_X86_ARCH(arch_, system_type_, rr_type_) RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_)
+#endif
 }
 
 #include "kernel_abi.h"
@@ -92,16 +102,22 @@ CHECK_ELF(ELFDATA2LSB == ELFENDIAN::DATA2LSB);
 static const uint8_t int80_insn[] = { 0xcd, 0x80 };
 static const uint8_t sysenter_insn[] = { 0x0f, 0x34 };
 static const uint8_t syscall_insn[] = { 0x0f, 0x05 };
+static const uint8_t svc0_insn[] = { 0x1, 0x0, 0x0, 0xd4 };
 
 bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
                                   SupportedArch* arch) {
+  if (t->arch() == aarch64) {
+    *arch = aarch64;
+    return true;
+  }
+
   // Lots of syscalls occur in the rr page and we know what it contains without
   // looking at it.
   // (Without this optimization we spend a few % of all CPU time in this
   // function in a syscall-dominated trace.)
   if (t->vm()->has_rr_page()) {
     const AddressSpace::SyscallType* type =
-        AddressSpace::rr_page_syscall_from_entry_point(ptr);
+        AddressSpace::rr_page_syscall_from_entry_point(t->arch(), ptr);
     if (type && (type->enabled == AddressSpace::RECORDING_AND_REPLAY ||
                  type->enabled == (t->session().is_recording()
                                        ? AddressSpace::RECORDING_ONLY
@@ -148,9 +164,24 @@ vector<uint8_t> syscall_instruction(SupportedArch arch) {
       return vector<uint8_t>(int80_insn, int80_insn + sizeof(int80_insn));
     case x86_64:
       return vector<uint8_t>(syscall_insn, syscall_insn + sizeof(syscall_insn));
+    case aarch64:
+      return vector<uint8_t>(svc0_insn, svc0_insn + sizeof(svc0_insn));
     default:
       DEBUG_ASSERT(0 && "Need to define syscall instruction");
       return vector<uint8_t>();
+  }
+}
+
+static ssize_t instruction_length(SupportedArch arch) {
+  switch (arch) {
+    case aarch64:
+      return 4;
+    default:
+      // x86 and x86_64 must be handled in the caller.
+      // Add new architectures here if all instructions have the same length,
+      // otherwise add them in the appropriate caller.
+      DEBUG_ASSERT(0 && "Need to define instruction length");
+      return 0;
   }
 }
 
@@ -160,9 +191,22 @@ ssize_t syscall_instruction_length(SupportedArch arch) {
     case x86_64:
       return 2;
     default:
-      DEBUG_ASSERT(0 && "Need to define syscall instruction length");
-      return 0;
+      return instruction_length(arch);
   }
+}
+
+ssize_t bkpt_instruction_length(SupportedArch arch) {
+  ssize_t val = 0;
+  switch (arch) {
+    case x86_64:
+    case x86:
+      val = 1;
+      break;
+    default:
+      val = instruction_length(arch);
+  }
+  DEBUG_ASSERT(val <= MAX_BKPT_INSTRUCTION_LENGTH);
+  return val;
 }
 
 ssize_t movrm_instruction_length(SupportedArch arch) {
@@ -172,8 +216,7 @@ ssize_t movrm_instruction_length(SupportedArch arch) {
     case x86_64:
       return 3;
     default:
-      DEBUG_ASSERT(0 && "Need to define movrm instruction length");
-      return 0;
+      return instruction_length(arch);
   }
 }
 
