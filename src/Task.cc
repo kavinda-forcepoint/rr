@@ -733,7 +733,7 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
               if (regs.arg3() == 0) {
                 // Work around a kernel bug in pre-4.7 kernels, where setting
                 // the gs/fs base to 0 via PTRACE_REGSET did not work correctly.
-                tracee->ptrace_if_alive(PTRACE_ARCH_PRCTL, regs.arg3(),
+                tracee->ptrace_if_alive(Arch::PTRACE_ARCH_PRCTL, regs.arg3(),
                                         (void*)(uintptr_t)regs.arg4());
               }
               if (code == ARCH_SET_FS) {
@@ -1021,7 +1021,7 @@ const ExtraRegisters& Task::extra_regs() {
     extra_registers.data_.resize(sizeof(ARM64Arch::user_fpregs_struct));
     struct iovec vec = { extra_registers.data_.data(),
                           extra_registers.data_.size() };
-    xptrace(PTRACE_GETREGSET, NT_PRFPREG, &vec);
+    xptrace(PTRACE_GETREGSET, NT_FPREGSET, &vec);
     extra_registers.data_.resize(vec.iov_len);
 #else
 #error need to define new extra_regs support
@@ -1385,7 +1385,7 @@ void Task::set_extra_regs(const ExtraRegisters& regs) {
     case ExtraRegisters::NT_FPR: {
       struct iovec vec = { extra_registers.data_.data(),
                             extra_registers.data_.size() };
-      ptrace_if_alive(PTRACE_SETREGSET, NT_PRFPREG, &vec);
+      ptrace_if_alive(PTRACE_SETREGSET, NT_FPREGSET, &vec);
       break;
     }
     default:
@@ -1519,7 +1519,7 @@ void Task::set_thread_area(remote_ptr<X86Arch::user_desc> tls) {
 int Task::emulate_set_thread_area(int idx, X86Arch::user_desc desc) {
   DEBUG_ASSERT(arch() == x86 || arch() == x86_64);
   errno = 0;
-  fallible_ptrace(PTRACE_SET_THREAD_AREA, idx, &desc);
+  fallible_ptrace(NativeArch::PTRACE_SET_THREAD_AREA, idx, &desc);
   if (errno != 0) {
     return errno;
   }
@@ -1532,7 +1532,7 @@ int Task::emulate_get_thread_area(int idx, X86Arch::user_desc& desc) {
   DEBUG_ASSERT(arch() == x86 || arch() == x86_64);
   LOG(debug) << "Emulating PTRACE_GET_THREAD_AREA";
   errno = 0;
-  fallible_ptrace(PTRACE_GET_THREAD_AREA, idx, &desc);
+  fallible_ptrace(NativeArch::PTRACE_GET_THREAD_AREA, idx, &desc);
   return errno;
 }
 
@@ -2062,13 +2062,18 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
       as->did_fork_into(t);
     }
 
-    if (CLONE_SHARE_FILES & flags) {
-      // Clear our desched_fd_child so that we don't try to close it.
-      // It should only be closed in |this|.
-      t->desched_fd_child = -1;
-      t->cloned_file_data_fd_child = -1;
+    // `t` doesn't have a syscallbuf and `t->desched_fd_child`/
+    // `t->cloned_file_data_fd_child` are both -1.
+    if (session().is_replaying()) {
+      // `t` is not really sharing our fd table, in fact our real fd table
+      // is only used by this task, so it only contains our syscallbuf fds (if any),
+      // not the fds for any other task. Close those in `t`.
+      AutoRemoteSyscalls remote(t);
+      t->close_buffers_for(remote, this);
+    } else if (CLONE_SHARE_FILES & flags) {
+      // `t` is sharing our fd table, so it should not close anything.
     } else {
-      // Close syscallbuf fds for tasks using the original fd table.
+      // Close syscallbuf fds for all tasks using the original fd table.
       AutoRemoteSyscalls remote(t);
       for (Task* tt : fds->task_set()) {
         t->close_buffers_for(remote, tt);
