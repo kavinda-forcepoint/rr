@@ -341,7 +341,7 @@ inline bool is_kernel_trap(int si_code) {
   /* XXX unable to find docs on which of these "should" be
    * right.  The SI_KERNEL code is seen in the int3 test, so we
    * at least need to handle that. */
-  return si_code == TRAP_BRKPT || si_code == SI_KERNEL;
+  return si_code == TRAP_TRACE || si_code == TRAP_BRKPT || si_code == SI_KERNEL;
 }
 
 enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
@@ -497,6 +497,9 @@ static inline struct timeval to_timeval(double t) {
   v.tv_usec = (int)floor((t - v.tv_sec) * 1000000);
   return v;
 }
+
+/* Slow but simple pop-count implementation. */
+int pop_count(uint64_t v);
 
 } // namespace rr
 

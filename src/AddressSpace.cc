@@ -56,7 +56,7 @@ static const char* trim_leading_blanks(const char* str) {
 }
 
 /**
- * Returns true if a task in t's task-group other than t is doing an exec.
+ * Returns true if a task in t's thread-group other than t is doing an exec.
  */
 static bool thread_group_in_exec(Task* t) {
   if (!t->session().is_recording()) {
@@ -625,7 +625,7 @@ SupportedArch AddressSpace::arch() const {
 
 BreakpointType AddressSpace::get_breakpoint_type_for_retired_insn(
     remote_code_ptr ip) {
-  remote_code_ptr addr = ip.decrement_by_bkpt_insn_length(SupportedArch::x86);
+  remote_code_ptr addr = ip.undo_executed_bkpt(arch());
   return get_breakpoint_type_at_addr(addr);
 }
 
@@ -1566,7 +1566,9 @@ void AddressSpace::verify(Task* t) const {
 // Just a place that rr's AutoSyscall functionality can use as a syscall
 // instruction in rr's address space for use before we have exec'd.
 extern "C" {
-extern char rr_syscall_addr;
+// Mark this as hidden, otherwise we might get the address of the GOT entry,
+// which could cause problems.
+extern char rr_syscall_addr __attribute__ ((visibility ("hidden")));
 }
 static void __attribute__((noinline, used)) fake_syscall() {
 #ifdef __i386__

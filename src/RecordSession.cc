@@ -160,6 +160,7 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
           // highly improbable.
           // Record the syscall-entry event that we otherwise failed to record.
           t->canonicalize_regs(t->arch());
+          t->apply_syscall_entry_regs();
           // Assume it's a native-arch syscall. If it isn't, it doesn't matter
           // all that much since we aren't actually going to do anything with it
           // in this task.
@@ -227,6 +228,21 @@ static void note_entering_syscall(RecordTask* t) {
      * (if it's not a SYS_restart_syscall restart)
      * will use the original registers. */
     t->ev().Syscall().regs = t->regs();
+  } else {
+    t->ev().Syscall().regs.set_syscallno(t->regs().syscallno());
+    // We may have intentionally stored the syscall result here.
+    // Now that we're safely past the signal delivery, make the
+    // registers look like they did at the original syscall entry
+    // again.
+    t->ev().Syscall().regs.set_arg1(t->ev().Syscall().regs.orig_arg1());
+    if (t->arch() == aarch64) {
+      // We probably got here with a PTRACE_SYSCALL. The x7
+      // value will be wrong due to the aarch64 kernel bug.
+      // Get it from the syscall event.
+      Registers r = t->regs();
+      r.set_x7(t->ev().Syscall().regs.x7());
+      t->set_regs(r);
+    }
   }
 }
 
@@ -266,7 +282,7 @@ void RecordSession::handle_seccomp_traced_syscall(RecordTask* t,
     t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
     t->vm()->remove_breakpoint(ret_addr, BKPT_INTERNAL);
 
-    ASSERT(t, t->regs().ip() == ret_addr.increment_by_bkpt_insn_length(t->arch()));
+    ASSERT(t, t->regs().ip().undo_executed_bkpt(t->arch()) == ret_addr);
 
     // Now that we're in a sane state, ask the Moneypatcher to try and patch
     // that.
@@ -389,6 +405,7 @@ static void handle_seccomp_trap(RecordTask* t,
   // entry did happen, so the registers are already updated according to the
   // architecture of the system call.
   t->canonicalize_regs(t->detect_syscall_arch());
+  t->apply_syscall_entry_regs();
 
   Registers r = t->regs();
   int syscallno = r.original_syscallno();
@@ -455,6 +472,9 @@ static void handle_seccomp_trap(RecordTask* t,
       break;
     case x86_64:
       si.native_api._sifields._sigsys._arch = AUDIT_ARCH_X86_64;
+      break;
+    case aarch64:
+      si.native_api._sifields._sigsys._arch = AUDIT_ARCH_AARCH64;
       break;
     default:
       DEBUG_ASSERT(0 && "Unknown architecture");
@@ -550,6 +570,7 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
       }
 
       uint16_t seccomp_data = t->get_ptrace_eventmsg_seccomp_data();
+      t->apply_syscall_entry_regs();
       int syscallno = t->regs().original_syscallno();
       if (seccomp_data == SECCOMP_RET_DATA) {
         LOG(debug) << "  traced syscall entered: "
@@ -902,7 +923,10 @@ static void maybe_discard_syscall_interruption(RecordTask* t, intptr_t ret) {
   syscallno = t->ev().Syscall().number;
   if (0 > ret) {
     syscall_not_restarted(t);
-  } else {
+  } else if (t->arch() == x86 || t->arch() == x86_64) {
+    // On x86, we would have expected this to get restored to the syscallno.
+    // Since the syscallno is in a different register on other platforms, this
+    // assert does not apply.
     ASSERT(t, syscallno == ret)
         << "Interrupted call was " << t->ev().Syscall().syscall_name()
         << " and sigreturn claims to be restarting "
@@ -915,7 +939,7 @@ static void maybe_discard_syscall_interruption(RecordTask* t, intptr_t ret) {
  * syscall number) from |from| to |to|.
  */
 static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
-  to->set_arg1(from.arg1());
+  to->set_orig_arg1(from.arg1());
   to->set_arg2(from.arg2());
   to->set_arg3(from.arg3());
   to->set_arg4(from.arg4());
@@ -975,6 +999,7 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         return;
       }
       last_task_switchable = PREVENT_SWITCH;
+      t->apply_syscall_entry_regs();
       t->ev().Syscall().regs = t->regs();
       t->ev().Syscall().state = ENTERING_SYSCALL;
       // The syscallno may have been changed by the ptracer
@@ -1066,7 +1091,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       // take this opportunity to possibly pop an
       // interrupted-syscall event.
       if (is_sigreturn(syscallno, syscall_arch)) {
-        ASSERT(t, t->regs().original_syscallno() == -1);
+        if (is_x86ish(t->arch())) {
+          ASSERT(t, t->regs().original_syscallno() == -1);
+        }
+        rec_did_sigreturn(t);
         t->record_current_event();
         t->pop_syscall();
 
@@ -1132,6 +1160,10 @@ void RecordSession::syscall_state_changed(RecordTask* t,
           Registers r = t->regs();
           copy_syscall_arg_regs(&r, t->ev().Syscall().regs);
           t->set_regs(r);
+          // We need to track what the return value was on architectures
+          // where the kernel replaces the return value by the new arg1
+          // on restart.
+          t->ev().Syscall().regs = r;
         }
         t->record_current_event();
 
@@ -1257,6 +1289,9 @@ static void setup_sigframe_siginfo_arch(RecordTask* t,
     case x86_64:
       dest = t->regs().si();
       break;
+    case aarch64:
+      dest = t->regs().x1();
+      break;
     default:
       DEBUG_ASSERT(0 && "Unknown architecture");
       break;
@@ -1297,20 +1332,7 @@ static bool preinject_signal(RecordTask* t) {
     // RecordTask::will_resume_execution().
     t->tgkill(t->session().syscallbuf_desched_sig());
 
-    /* Now singlestep the task until we're in a signal-stop for the signal
-     * we've just sent. We must absorb and forget that signal here since we
-     * don't want it delivered to the task for real.
-     */
-    auto old_ip = t->ip();
-    do {
-      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
-      ASSERT(t, old_ip == t->ip())
-          << "Singlestep actually advanced when we "
-          << "just expected a signal; was at " << old_ip << " now at "
-          << t->ip() << " with status " << t->status();
-      // Ignore any pending TIME_SLICE_SIGNALs and continue until we get our
-      // SYSCALLBUF_DESCHED_SIGNAL.
-    } while (t->stop_sig() == PerfCounters::TIME_SLICE_SIGNAL);
+    t->move_to_signal_stop();
 
     if (t->status().ptrace_event() == PTRACE_EVENT_EXIT) {
       /* We raced with an exit (e.g. due to a pending SIGKILL). */
@@ -1430,20 +1452,27 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
           break;
         }
 
-        // It's somewhat difficult engineering-wise to
-        // compute the sigframe size at compile time,
-        // and it can vary across kernel versions and CPU
-        // microarchitectures. So this size is an overestimate
-        // of the real size(s).
-        //
-        // If this size becomes too small in the
-        // future, and unit tests that use sighandlers
-        // are run with checksumming enabled, then
-        // they can catch errors here.
-        sigframe_size = 1152 /* Overestimate of kernel sigframe */ +
-                        128 /* Redzone */ +
-                        /* this returns 512 when XSAVE unsupported */
-                        xsave_area_size();
+        if (is_x86ish(t->arch())) {
+          // It's somewhat difficult engineering-wise to
+          // compute the sigframe size at compile time,
+          // and it can vary across kernel versions and CPU
+          // microarchitectures. So this size is an overestimate
+          // of the real size(s).
+          //
+          // If this size becomes too small in the
+          // future, and unit tests that use sighandlers
+          // are run with checksumming enabled, then
+          // they can catch errors here.
+          sigframe_size = 1152 /* Overestimate of kernel sigframe */ +
+                          128 /* Redzone */ +
+                          /* this returns 512 when XSAVE unsupported */
+                          xsave_area_size();
+        } else if (t->arch() == aarch64) {
+          sigframe_size = sizeof(ARM64Arch::rt_sigframe) +
+                          sizeof(ARM64Arch::user_fpsimd_state);
+        } else {
+          DEBUG_ASSERT(0 && "Add sigframe size for your architecture here");
+        }
 
         t->ev().transform(EV_SIGNAL_HANDLER);
         t->signal_delivered(sig);
@@ -1502,21 +1531,20 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
       bool has_other_signals = t->has_any_actionable_signal();
       auto r = t->regs();
       if (!is_fatal) {
-        if (can_switch == PREVENT_SWITCH && !has_other_signals &&
-            r.original_syscallno() >= 0 && r.syscall_may_restart()) {
-          switch (r.syscall_result_signed()) {
+        Event *prev_ev = t->prev_ev();
+        if (can_switch == PREVENT_SWITCH && !has_other_signals && prev_ev &&
+            EV_SYSCALL_INTERRUPTION == prev_ev->type()) {
+          switch (prev_ev->Syscall().regs.syscall_result_signed()) {
             case -ERESTARTNOHAND:
             case -ERESTARTSYS:
             case -ERESTARTNOINTR:
               r.set_syscallno(r.original_syscallno());
-              r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
               break;
             case -ERESTART_RESTARTBLOCK:
               r.set_syscallno(syscall_number_for_restart_syscall(t->arch()));
-              r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
               break;
           }
-
+          r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
           // Now that we've mucked with the registers, we can't switch tasks. That
           // could allow more signals to be generated, breaking our assumption
           // that we are the last signal.
@@ -1577,6 +1605,17 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
          */
         t->pop_signal_delivery();
       }
+
+      // Mark each task in this address space as expecting a ptrace exit
+      // to avoid causing any ptrace_exit reaces.
+      if (is_fatal && is_coredumping_signal(sig)) {
+        for (Task *ot : t->vm()->task_set()) {
+          if (t != ot) {
+            ((RecordTask *)ot)->waiting_for_ptrace_exit = true;
+          }
+        }
+      }
+
       last_task_switchable = can_switch;
       step_state->continue_type = DONT_CONTINUE;
       break;
@@ -1804,6 +1843,7 @@ void RecordSession::runnable_state_changed(RecordTask* t, StepState* step_state,
 
       SupportedArch syscall_arch = t->detect_syscall_arch();
       t->canonicalize_regs(syscall_arch);
+      t->apply_syscall_entry_regs();
       process_syscall_entry(t, step_state, step_result, syscall_arch);
       return;
     }
@@ -2177,7 +2217,7 @@ RecordSession::RecordSession(const std::string& exe_path,
                   &tracee_socket_fd_number,
                   exe_path, argv, envp));
 
-  if (NativeArch::arch() == x86 || NativeArch::arch() == x86_64) {
+  if (NativeArch::is_x86ish()) {
     // CPU affinity has been set.
     trace_out.setup_cpuid_records(has_cpuid_faulting(), disable_cpuid_features_);
   }
@@ -2320,9 +2360,10 @@ void RecordSession::terminate_recording() {
 
 void RecordSession::kill_all_record_tasks() {
   LOG(debug) << "Killing all tasks ...";
-  for (int pass = 0; pass <= 1; ++pass) {
-    /* We delete tasks in two passes. First, we kill
-     * every non-thread-group-leader, then we kill every group leader.
+  for (int pass = 0; pass <= 2; ++pass) {
+    /* We delete tasks in three passes. First we complete any coredumps in
+     * progress. Then, we kill every non-thread-group-leader,
+     * lastly we kill every group leader.
      * Linux expects threads group leaders to survive until the last
      * member of the thread group has exited, so we accomodate that.
      */
@@ -2331,6 +2372,18 @@ void RecordSession::kill_all_record_tasks() {
       // If the task was detached and none of our tasks explicitly waited for
       // it, we let the detached task just run freely (the zombie proxy we
       // keep around kill get reaped when we destroy the RecordTask itself)
+      if (pass == 0) {
+        if (t->waiting_for_ptrace_exit && !t->seen_ptrace_exit_event) {
+          t->wait();
+          if (!t->already_exited()) {
+            record_exit_trace_event(t, t->status());
+            t->record_exit_event(t->status().fatal_sig());
+          }
+          t->did_kill();
+          t->fallible_ptrace(PTRACE_CONT, nullptr, nullptr);
+        }
+        continue;
+      }
       if (t->detached_proxy) {
         continue;
       }
@@ -2338,13 +2391,17 @@ void RecordSession::kill_all_record_tasks() {
         continue;
       }
       bool is_group_leader = t->tid == t->real_tgid();
-      if (pass == 0 ? is_group_leader : !is_group_leader) {
+      if (pass == 1 ? is_group_leader : !is_group_leader) {
         continue;
       }
-      WaitStatus status = t->kill();
-      if (!t->already_exited()) {
-        record_exit_trace_event(t, status);
-        t->record_exit_event(status.fatal_sig());
+      if (t->waiting_for_ptrace_exit) {
+        t->reap();
+      } else {
+        WaitStatus status = t->kill();
+        if (!t->already_exited()) {
+          record_exit_trace_event(t, status);
+          t->record_exit_event(status.fatal_sig());
+        }
       }
     }
   }

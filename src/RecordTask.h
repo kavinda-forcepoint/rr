@@ -413,6 +413,14 @@ public:
   const Event& ev() const { return pending_events.back(); }
 
   /**
+   * Obtain the previous event on the stack (if any) or nullptr (if not)
+   */
+  Event *prev_ev() {
+    ssize_t depth = pending_events.size();
+    return depth > 2 ? &pending_events[depth - 2] : nullptr;
+  }
+
+  /**
    * Call this before recording events or data.  Records
    * syscallbuf data and flushes the buffer, if there's buffered
    * data.
@@ -473,11 +481,6 @@ public:
    * without CLONE_THREAD, or PTRACE_FORK_EVENT.
    */
   pid_t find_newborn_process(pid_t child_parent);
-
-  /**
-   * Do a tgkill to send a specific signal to this task.
-   */
-  void tgkill(int sig);
 
   /**
    * If the process looks alive, kill it. It is recommended to call try_wait(),
@@ -734,6 +737,10 @@ public:
 
   // This task is waiting to reach zombie state
   bool waiting_for_zombie;
+
+  // This task is waiting for a ptrace exit event. It should not
+  // be manuall run.
+  bool waiting_for_ptrace_exit;
 
   // When exiting a syscall, we should call MonkeyPatcher::try_patch_syscall again.
   bool retry_syscall_patching;

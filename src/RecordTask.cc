@@ -195,6 +195,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       did_record_robust_futex_changes(false),
       waiting_for_reap(false),
       waiting_for_zombie(false),
+      waiting_for_ptrace_exit(false),
       retry_syscall_patching(false) {
   push_event(Event::sentinel());
   if (session.tasks().empty()) {
@@ -548,7 +549,7 @@ void RecordTask::on_syscall_exit(int syscallno, SupportedArch arch,
 }
 
 bool RecordTask::is_at_syscallbuf_syscall_entry_breakpoint() {
-  auto i = ip().decrement_by_bkpt_insn_length(arch());
+  auto i = ip().undo_executed_bkpt(arch());
   for (auto p : syscallbuf_syscall_entry_breakpoints()) {
     if (i == p) {
       return true;
@@ -561,7 +562,7 @@ bool RecordTask::is_at_syscallbuf_final_instruction_breakpoint() {
   if (!break_at_syscallbuf_final_instruction) {
     return false;
   }
-  auto i = ip().decrement_by_bkpt_insn_length(arch());
+  auto i = ip().undo_executed_bkpt(arch());
   return i == syscallbuf_code_layout.syscallbuf_final_exit_instruction;
 }
 
@@ -1070,6 +1071,7 @@ void RecordTask::emulate_SIGCONT() {
   for (Task* t : thread_group()->task_set()) {
     auto rt = static_cast<RecordTask*>(t);
     LOG(debug) << "setting " << tid << " to NOT_STOPPED due to SIGCONT";
+    rt->clear_stashed_group_stop();
     rt->emulated_stop_pending = false;
     rt->emulated_stop_type = NOT_STOPPED;
   }
@@ -1516,7 +1518,8 @@ bool RecordTask::may_be_blocked() const {
          emulated_stop_type != NOT_STOPPED ||
          (EV_SIGNAL_DELIVERY == ev().type() &&
           DISPOSITION_FATAL == ev().Signal().disposition) ||
-         waiting_for_zombie;
+         waiting_for_zombie ||
+         waiting_for_ptrace_exit;
 }
 
 bool RecordTask::maybe_in_spinlock() {
@@ -1877,11 +1880,6 @@ void RecordTask::update_own_namespace_tid() {
   if (own_namespace_rec_tid == -ESRCH) {
     own_namespace_rec_tid = -1;
   }
-}
-
-void RecordTask::tgkill(int sig) {
-  LOG(debug) << "Sending " << sig << " to tid " << tid;
-  ASSERT(this, 0 == syscall(SYS_tgkill, real_tgid(), tid, sig));
 }
 
 void RecordTask::kill_if_alive() {

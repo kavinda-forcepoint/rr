@@ -265,7 +265,7 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   // Fix registers in new task
   Registers new_r = new_task->regs();
   new_r.set_original_syscallno(trace_frame.regs().original_syscallno());
-  new_r.set_arg1(trace_frame.regs().arg1());
+  new_r.set_orig_arg1(trace_frame.regs().arg1());
   new_r.set_arg2(trace_frame.regs().arg2());
   new_task->set_regs(new_r);
   new_task->canonicalize_regs(new_task->arch());
@@ -734,7 +734,7 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
   step->action = TSTEP_RETIRE;
 
   auto& trace_regs = trace_frame.regs();
-  remote_ptr<void> old_addr = trace_frame.regs().arg1();
+  remote_ptr<void> old_addr = trace_frame.regs().orig_arg1();
   size_t old_size = ceil_page_size(trace_regs.arg2());
   remote_ptr<void> new_addr = trace_frame.regs().syscall_result();
   size_t new_size = ceil_page_size(trace_regs.arg3());
@@ -1089,7 +1089,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       switch (Arch::mmap_semantics) {
         case Arch::StructArguments: {
           auto args = t->read_mem(
-              remote_ptr<typename Arch::mmap_args>(trace_regs.arg1()));
+              remote_ptr<typename Arch::mmap_args>(trace_regs.orig_arg1()));
           return process_mmap(t, trace_frame, args.len, args.prot, args.flags,
                               args.fd, args.offset / page_size(), step);
         }
@@ -1110,7 +1110,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       return process_shmat(t, trace_frame, trace_regs.arg3(), step);
 
     case Arch::shmdt:
-      return process_shmdt(t, trace_frame, trace_regs.arg1(), step);
+      return process_shmdt(t, trace_frame, trace_regs.orig_arg1(), step);
 
     case Arch::mremap:
       return process_mremap(t, trace_frame, step);
@@ -1128,6 +1128,17 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       auto arg1 = t->regs().arg1();
       if (sys == Arch::arch_prctl &&
           (arg1 == ARCH_GET_CPUID || arg1 == ARCH_SET_CPUID)) {
+        return;
+      }
+    }
+      RR_FALLTHROUGH;
+    case Arch::prctl: {
+      auto arg1 = t->regs().arg1();
+      if (sys == Arch::prctl && (Arch::arch() != aarch64 ||
+          arg1 != PR_SET_SPECULATION_CTRL)) {
+        // On aarch64 PR_SET_SPECULATION_CTRL affects the pstate
+        // register during the system call, so we need to replay
+        // it, otherwise we'll get a mismatch there.
         return;
       }
     }
@@ -1160,7 +1171,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
     }
 
     case Arch::ipc:
-      switch ((int)trace_regs.arg1_signed()) {
+      switch ((int)trace_regs.orig_arg1_signed()) {
         case SHMAT:
           return process_shmat(t, trace_frame, trace_regs.arg3(), step);
         case SHMDT:
@@ -1172,6 +1183,12 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
 
     case Arch::sigreturn:
     case Arch::rt_sigreturn:
+      if (Arch::arch() == aarch64) {
+        // The aarch64 kernel has a bug where it refuses to apply updates
+        // to x7 during any syscall stops. Make sure to move to a signal
+        // stop if we reached here using sysemu.
+        t->move_to_signal_stop();
+      }
       t->set_regs(trace_regs);
       t->set_extra_regs(trace_frame.extra_regs());
       step->action = TSTEP_RETIRE;
@@ -1185,7 +1202,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       int allowed_perf_flags = PERF_FLAG_FD_CLOEXEC;
       if (target && cpu == -1 && !(flags & ~allowed_perf_flags)) {
         auto attr =
-            t->read_mem(remote_ptr<struct perf_event_attr>(trace_regs.arg1()));
+            t->read_mem(remote_ptr<struct perf_event_attr>(trace_regs.orig_arg1()));
         if (VirtualPerfCounterMonitor::should_virtualize(attr)) {
           t->fd_table()->add_monitor(t,
               fd, new VirtualPerfCounterMonitor(t, target, attr));

@@ -418,7 +418,7 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
   frame.setArch(to_trace_arch(t->arch()));
   if (registers) {
     // Avoid dynamic allocation and copy
-    auto raw_regs = registers->get_ptrace_for_self_arch();
+    auto raw_regs = registers->get_regs_for_trace();
     frame.initRegisters().setRaw(Data::Reader(raw_regs.data, raw_regs.size));
   }
   if (extra_registers) {
@@ -545,13 +545,16 @@ TraceFrame TraceReader::read_frame() {
   ret.recorded_regs.set_arch(arch);
   auto reg_data = frame.getRegisters().getRaw();
   if (reg_data.size()) {
-    ret.recorded_regs.set_from_ptrace_for_arch(arch, reg_data.begin(),
-                                               reg_data.size());
+    ret.recorded_regs.set_from_trace(arch, reg_data.begin(),
+                                     reg_data.size());
   }
   auto extra_reg_data = frame.getExtraRegisters().getRaw();
   if (extra_reg_data.size()) {
     ExtraRegisters::Format fmt;
     switch (arch) {
+      default:
+        FATAL() << "Unknown architecture";
+        RR_FALLTHROUGH;
       case x86:
       case x86_64:
         fmt = ExtraRegisters::XSAVE;
@@ -559,8 +562,6 @@ TraceFrame TraceReader::read_frame() {
       case aarch64:
         fmt = ExtraRegisters::NT_FPR;
         break;
-      default:
-        FATAL() << "Unknown architecture";
     }
     bool ok = ret.recorded_extra_regs.set_to_raw_data(
         arch, fmt, extra_reg_data.begin(),
@@ -1314,7 +1315,7 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   header.setRrcallBase(syscall_number_for_rrcall_init_preload(x86_64));
 
   header.setNativeArch(to_trace_arch(NativeArch::arch()));
-  if (NativeArch::arch() == x86 || NativeArch::arch() == x86_64)
+  if (NativeArch::is_x86ish())
   {
     auto x86data = header.initX86();
     x86data.setHasCpuidFaulting(has_cpuid_faulting_);
@@ -1473,7 +1474,7 @@ TraceReader::TraceReader(const string& dir)
   memcpy(uuid_->bytes, uuid.begin(), sizeof(uuid_->bytes));
 
   arch_ = from_trace_arch(header.getNativeArch());
-  if (arch_ == x86 || arch_ == x86_64) {
+  if (is_x86ish(arch_)) {
     auto x86data = header.getX86();
     trace_uses_cpuid_faulting = x86data.getHasCpuidFaulting();
     Data::Reader cpuid_records_bytes = x86data.getCpuidRecords();

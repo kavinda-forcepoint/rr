@@ -937,8 +937,64 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
 }
 
 template <>
-void patch_after_exec_arch<ARM64Arch>(RecordTask*, Monkeypatcher&) {
-  FATAL() << "Unimplemented";
+void patch_after_exec_arch<ARM64Arch>(RecordTask* t, Monkeypatcher& patcher) {
+  setup_preload_library_path<ARM64Arch>(t);
+  setup_audit_library_path<ARM64Arch>(t);
+
+  for (const auto& m : t->vm()->maps()) {
+    auto& km = m.map;
+    patcher.patch_after_mmap(t, km.start(), km.size(),
+                             km.file_offset_bytes()/page_size(), -1,
+                             Monkeypatcher::MMAP_EXEC);
+  }
+
+  if (!t->vm()->has_vdso()) {
+    patch_auxv_vdso(t);
+    return;
+  }
+
+  auto vdso_start = t->vm()->vdso().start();
+
+  VdsoReader reader(t);
+  auto syms = reader.read_symbols(".dynsym", ".dynstr");
+
+  static const named_syscall syscalls_to_monkeypatch[] = {
+#define S(n) { "__kernel_" #n, ARM64Arch::n }
+    S(rt_sigreturn), S(gettimeofday), S(clock_gettime), S(clock_getres),
+#undef S
+  };
+
+  for (auto& syscall : syscalls_to_monkeypatch) {
+    for (size_t i = 0; i < syms.size(); ++i) {
+      if (syms.is_name(i, syscall.name)) {
+        uintptr_t file_offset;
+        if (!reader.addr_to_offset(syms.addr(i), file_offset)) {
+          LOG(debug) << "Can't convert address " << HEX(syms.addr(i))
+                     << " to offset";
+          continue;
+        }
+
+        uint64_t file_offset_64 = file_offset;
+        static const uint64_t vdso_max_size = 0xffffLL;
+        uint64_t sym_offset = file_offset_64 & vdso_max_size;
+        uintptr_t absolute_address = vdso_start.as_int() + sym_offset;
+
+        uint8_t patch[ARM64VdsoMonkeypatch::size];
+        uint32_t syscall_number = syscall.syscall_number;
+        ARM64VdsoMonkeypatch::substitute(patch, syscall_number);
+
+        write_and_record_bytes(t, absolute_address, patch);
+        // Record the location of the syscall instruction, skipping the
+        // "mov $syscall_number,x8".
+        patcher.patched_vdso_syscalls.insert(
+            remote_code_ptr(absolute_address + 4));
+        LOG(debug) << "monkeypatched " << syscall.name << " to syscall "
+                    << syscall.syscall_number << " at "
+                    << HEX(absolute_address) << " (" << HEX(file_offset)
+                    << ")";
+      }
+    }
+  }
 }
 
 template <>

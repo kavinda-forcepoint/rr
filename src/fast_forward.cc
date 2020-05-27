@@ -157,10 +157,6 @@ static void bound_iterations_for_watchpoint(Task* t, remote_ptr<void> reg,
   *iterations = min(*iterations, steps);
 }
 
-static bool is_x86ish(Task* t) {
-  return t->arch() == x86 || t->arch() == x86_64;
-}
-
 FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
                                                    const vector<const Registers*>& states) {
   DEBUG_ASSERT(how == RESUME_SINGLESTEP || how == RESUME_SYSEMU_SINGLESTEP);
@@ -181,7 +177,7 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
     // breakpoint must have fired
     return result;
   }
-  if (t->vm()->notify_watchpoint_fired(t->debug_status(),
+  if (t->vm()->notify_watchpoint_fired(t->x86_debug_status(),
           t->last_execution_resume())) {
     // watchpoint fired
     return result;
@@ -191,7 +187,7 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
       return result;
     }
   }
-  if (!is_x86ish(t)) {
+  if (!is_x86ish(t->arch())) {
     return result;
   }
 
@@ -231,7 +227,7 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
     uintptr_t cur_cx = t->regs().cx();
     if (cur_cx == 0) {
       // Fake singlestep status for trap diagnosis
-      t->set_debug_status(DS_SINGLESTEP);
+      t->set_x86_debug_status(DS_SINGLESTEP);
       // This instruction will be skipped entirely.
       return result;
     }
@@ -292,7 +288,7 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
 
     if (iterations == 0) {
       // Fake singlestep status for trap diagnosis
-      t->set_debug_status(DS_SINGLESTEP);
+      t->set_x86_debug_status(DS_SINGLESTEP);
       return result;
     }
 
@@ -346,7 +342,7 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
 
     LOG(debug) << "x86-string fast-forward done; ip()==" << t->ip();
     // Fake singlestep status for trap diagnosis
-    t->set_debug_status(DS_SINGLESTEP);
+    t->set_x86_debug_status(DS_SINGLESTEP);
     return result;
   }
 }
@@ -439,7 +435,7 @@ static bool is_string_instruction_before(Task* t, remote_code_ptr ip) {
 }
 
 bool maybe_at_or_after_x86_string_instruction(Task* t) {
-  if (!is_x86ish(t)) {
+  if (!is_x86ish(t->arch())) {
     return false;
   }
 
@@ -448,7 +444,7 @@ bool maybe_at_or_after_x86_string_instruction(Task* t) {
 }
 
 bool at_x86_string_instruction(Task* t) {
-  if (!is_x86ish(t)) {
+  if (!is_x86ish(t->arch())) {
     return false;
   }
 

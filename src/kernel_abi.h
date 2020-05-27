@@ -27,6 +27,10 @@ const SupportedArch RR_NATIVE_ARCH = SupportedArch::aarch64;
 #error need to define new SupportedArch enum
 #endif
 
+inline bool is_x86ish(SupportedArch arch_) {
+  return arch_ == x86 || arch_ == x86_64;
+}
+
 template <SupportedArch a, typename system_type, typename rr_type>
 struct Verifier {
   // Optimistically say we are the same size.
@@ -293,6 +297,9 @@ struct BaseArch : public wordsize,
                   public FcntlConstants,
                   public KernelConstants {
   static SupportedArch arch() { return arch_; }
+  static bool is_x86ish() {
+    return rr::is_x86ish(arch_);
+  }
 
   typedef typename wordsize::syscall_slong_t syscall_slong_t;
   typedef typename wordsize::syscall_ulong_t syscall_ulong_t;
@@ -912,27 +919,6 @@ struct BaseArch : public wordsize,
     iwreq_data u;
   };
   RR_VERIFY_TYPE(iwreq);
-
-  struct ethtool_cmd {
-    uint32_t cmd;
-    uint32_t supported;
-    uint32_t advertising;
-    uint16_t speed;
-    uint8_t duplex;
-    uint8_t port;
-    uint8_t phy_address;
-    uint8_t transceiver;
-    uint8_t autoneg;
-    uint8_t mdio_support;
-    uint32_t maxtxpkt;
-    uint32_t maxrxpkt;
-    uint16_t speed_hi;
-    uint8_t eth_tp_mdix;
-    uint8_t eth_tp_mdix_ctrl;
-    uint32_t lp_advertising;
-    uint32_t reserved[2];
-  };
-  RR_VERIFY_TYPE(ethtool_cmd);
 
   struct _flock {
     signed_short l_type;
@@ -2124,6 +2110,26 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     uint32_t rr_reserved[2];
   };
   typedef struct user_fpsimd_state user_fpregs_struct;
+
+  struct sigcontext {
+    __u64 fault_addr;
+    user_pt_regs regs;
+    // ISA extension state follows here
+  };
+
+  struct ucontext {
+    unsigned long	uc_flags;
+    ptr<ucontext> uc_link;
+    stack_t		  uc_stack;
+    sigset_t	  uc_sigmask;
+    uint8_t __unused[1024 / 8 - sizeof(sigset_t)];
+    struct sigcontext uc_mcontext;
+  };
+
+  struct rt_sigframe {
+    siginfo_t info;
+    struct ucontext uc;
+  };
 
   RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::semid64_ds, struct semid64_ds);
 };

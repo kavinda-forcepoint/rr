@@ -177,7 +177,7 @@ ReplaySession::ReplaySession(const std::string& dir, const Flags& flags)
            "to this machine; replay will not work.";
   }
 
-  if (trace_in.arch() == x86 || trace_in.arch() == x86_64) {
+  if (is_x86ish(trace_in.arch())) {
     if (trace_in.uses_cpuid_faulting() && !has_cpuid_faulting()) {
       CLEAN_FATAL()
           << "Trace was recorded with CPUID faulting enabled, but this\n"
@@ -555,7 +555,7 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
 
     if (cont_syscall_boundary(t, constraints) == INCOMPLETE) {
       bool reached_target = syscall_bp_vm && SIGTRAP == t->stop_sig() &&
-                            t->ip().decrement_by_bkpt_insn_length(t->arch()) ==
+                            t->ip().undo_executed_bkpt(t->arch()) ==
                                 syscall_instruction &&
                             t->vm()->get_breakpoint_type_at_addr(
                                 syscall_instruction) == BKPT_INTERNAL;
@@ -566,7 +566,7 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
             syscall_instruction.increment_by_syscall_insn_length(t->arch()));
         r.set_original_syscallno(r.syscallno());
         r.set_orig_arg1(r.arg1());
-        if (t->arch() == x86 || t->arch() == x86_64) {
+        if (is_x86ish(t->arch())) {
           r.set_syscall_result(-ENOSYS);
         }
         t->set_regs(r);
@@ -691,7 +691,7 @@ static void guard_overshoot(ReplayTask* t, const Registers& target_regs,
      * have been had it not hit the breakpoint (if it did
      * hit the breakpoint).*/
     t->vm()->remove_breakpoint(target_ip, BKPT_INTERNAL);
-    if (t->regs().ip() == target_ip.increment_by_bkpt_insn_length(t->arch())) {
+    if (t->regs().ip().undo_executed_bkpt(t->arch()) == target_ip) {
       t->move_ip_before_breakpoint();
     }
     if (closest_matching_regs) {
@@ -864,8 +864,7 @@ Completion ReplaySession::emulate_async_signal(
         // deterministic signal instead of an async one.
         // So we must have hit our internal breakpoint.
         ASSERT(t, did_set_internal_breakpoint);
-        ASSERT(t,
-               regs.ip().increment_by_bkpt_insn_length(t->arch()) == t->ip());
+        ASSERT(t, regs.ip() == t->ip().undo_executed_bkpt(t->arch()));
         // We didn't do an internal singlestep, and if we'd done a
         // user-requested singlestep we would have hit the above case.
         ASSERT(t, !trap_reasons.singlestep);
@@ -874,10 +873,6 @@ Completion ReplaySession::emulate_async_signal(
          * check again if we're at the
          * target. */
         LOG(debug) << "    trap was for target $ip";
-        /* (The breakpoint would have trapped
-         * at the $ip one byte beyond the
-         * target.) */
-        DEBUG_ASSERT(!at_target);
 
         pending_SIGTRAP = false;
         t->move_ip_before_breakpoint();
@@ -1237,7 +1232,7 @@ Completion ReplaySession::flush_syscallbuf(ReplayTask* t,
   if (legacy_breakpoint_mode) {
     ASSERT(t, t->stop_sig() == SIGTRAP)
         << "Replay got unexpected signal (or none) " << t->stop_sig();
-    if (t->ip().decrement_by_bkpt_insn_length(t->arch()) ==
+    if (t->ip().undo_executed_bkpt(t->arch()) ==
             remote_code_ptr(remote_brkpt_addr) &&
         !user_breakpoint_at_addr) {
       Registers r = t->regs();
@@ -1288,7 +1283,7 @@ Completion ReplaySession::patch_vsyscall(ReplayTask* t, const StepConstraints& c
 
   ASSERT(t, t->stop_sig() == SIGTRAP)
       << "Replay got unexpected signal (or none) " << t->stop_sig();
-  ASSERT(t, t->regs().ip().decrement_by_bkpt_insn_length(t->arch()) == vsyscall_entry);
+  ASSERT(t, t->regs().ip().undo_executed_bkpt(t->arch()) == vsyscall_entry);
 
   t->apply_all_data_records_from_trace();
   Registers r = t->regs();
@@ -1601,6 +1596,27 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
         if (current_step.action == TSTEP_RETIRE) {
           t->on_syscall_exit(current_step.syscall.number,
                              current_step.syscall.arch, trace_frame.regs());
+          if (t->arch() == aarch64 && t->regs().syscall_may_restart()) {
+            // If we're restarting a system call, we may have to apply register
+            // modifications to match what the kernel does. Whether or not we need
+            // to do this depends on the ordering of the kernel's register
+            // modification and the signal stop that interrupted the system
+            // call. On x86, the ptrace stop happens first, and then all
+            // register modifications happen. On aarch64, some register
+            // modifications happen [1], then the ptrace stop and then
+            // potentially more register modifications. Any register
+            // modifications that happen after the ptrace signal stop will
+            // get recorded in the signal frame and thus don't need any
+            // special handling. However, for register modifications that
+            // happen before the signal stop, we need to apply them here.
+            // On x86, there are none, but on aarch64, we need to restore arg1
+            // and pc.
+            // [1] https://github.com/torvalds/linux/blob/caffb99b6929f41a69edbb5aef3a359bf45f3315/arch/arm64/kernel/signal.c#L855-L862
+            Registers r = t->regs();
+            r.set_arg1(r.orig_arg1());
+            r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
+            t->set_regs(r);
+          }
         }
       }
       break;
