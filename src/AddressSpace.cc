@@ -277,28 +277,6 @@ remote_code_ptr AddressSpace::find_syscall_instruction(Task* t) {
           .as_int());
 }
 
-static string find_rr_page_file(Task* t) {
-  string path = resource_path() + "share/rr/rr_page_";
-  switch (t->arch()) {
-    case x86:
-      path += "32";
-      break;
-    case x86_64:
-      path += "64";
-      break;
-    case aarch64:
-      path += "arm64";
-      break;
-    default:
-      ASSERT(t, false) << "Unknown architecture";
-      return path;
-  }
-  if (!t->session().is_recording()) {
-    path += "_replay";
-  }
-  return path;
-}
-
 void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
   int prot = PROT_EXEC | PROT_READ;
   int flags = MAP_PRIVATE | MAP_FIXED;
@@ -307,22 +285,39 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
   Task* t = remote.task();
   SupportedArch arch = t->arch();
 
-  string path = find_rr_page_file(t);
+  const char *fname;
+  switch (t->arch()) {
+    case x86_64:
+    case aarch64:
+      fname = RRPAGE_LIB_FILENAME;
+      break;
+    case x86:
+      fname = RRPAGE_LIB_FILENAME_32;
+      break;
+  }
+
+  string path = find_helper_library(fname);
+  if (path.empty()) {
+    FATAL() << "Failed to locate " << fname;
+  }
+  path += fname;
+  size_t offset_pages = t->session().is_recording() ? 1 : 2;
 
   {
     ScopedFd page(path.c_str(), O_RDONLY);
-    ASSERT(t, page.is_open()) << "Failed to open rr_page file " << path;
+    ASSERT(t, page.is_open()) << "Failed to open rrpage library " << path;
     long child_fd = remote.send_fd(page.get());
     ASSERT(t, child_fd >= 0);
     remote.infallible_mmap_syscall(rr_page_start(), rr_page_size(), prot, flags,
-                                   child_fd, 0);
+                                   child_fd, offset_pages);
 
     struct stat fstat = t->stat_fd(child_fd);
     file_name = t->file_name_of_fd(child_fd);
 
     remote.infallible_syscall(syscall_number_for_close(arch), child_fd);
 
-    map(t, rr_page_start(), rr_page_size(), prot, flags, 0, file_name,
+    map(t, rr_page_start(), rr_page_size(), prot, flags,
+        offset_pages * page_size(), file_name,
         fstat.st_dev, fstat.st_ino);
   }
   mapping_flags_of(rr_page_start()) = Mapping::IS_RR_PAGE;
@@ -377,6 +372,8 @@ static const AddressSpace::SyscallType entry_points[] = {
     AddressSpace::REPLAY_ONLY },
   { AddressSpace::UNTRACED, AddressSpace::PRIVILEGED,
     AddressSpace::RECORDING_ONLY },
+  { AddressSpace::UNTRACED, AddressSpace::UNPRIVILEGED,
+    AddressSpace::REPLAY_ASSIST },
 };
 
 static int rr_page_syscall_stub_size(SupportedArch arch) {
@@ -480,7 +477,19 @@ vector<AddressSpace::SyscallType> AddressSpace::rr_page_syscalls() {
   return result;
 }
 
-void AddressSpace::save_auxv(Task* t) { saved_auxv_ = read_auxv(t); }
+void AddressSpace::save_auxv(Task* t) {
+  saved_auxv_ = read_auxv(t);
+  save_interpreter_base(t, saved_auxv());
+}
+
+void AddressSpace::save_interpreter_base(Task* t, std::vector<uint8_t> auxv) {
+  saved_interpreter_base_ = read_interpreter_base(auxv);
+  save_ld_path(t, saved_interpreter_base());
+}
+
+void AddressSpace::save_ld_path(Task* t, remote_ptr<void> interpreter_base) {
+  saved_ld_path_ = read_ld_path(t, interpreter_base);
+}
 
 void AddressSpace::read_mm_map(Task* t, struct prctl_mm_map* map) {
   char buf[PATH_MAX+1024];
@@ -1177,6 +1186,7 @@ static bool watchpoint_triggered(uintptr_t debug_status,
 }
 
 bool AddressSpace::notify_watchpoint_fired(uintptr_t debug_status,
+    remote_ptr<void> hit_addr,
     remote_code_ptr address_of_singlestep_start) {
   bool triggered = false;
   for (auto& it : watchpoints) {
@@ -1189,15 +1199,25 @@ bool AddressSpace::notify_watchpoint_fired(uintptr_t debug_status,
     // execute.
     bool write_triggered = (it.second.watched_bits() & WRITE_BIT) &&
         update_watchpoint_value(it.first, it.second);
-    bool read_triggered = (it.second.watched_bits() & READ_BIT) &&
+    // Depending on the architecture the hardware may indicate hit watchpoints
+    // either by number, or by the address that triggered the watchpoint hit
+    // - support either.
+    bool read_triggered = false;
+    bool exec_triggered = false;
+    bool watchpoint_in_range = false;
+    if (is_x86ish(arch())) {
+      read_triggered = (it.second.watched_bits() & READ_BIT) &&
         watchpoint_triggered(debug_status,
                              it.second.debug_regs_for_exec_read);
-    bool exec_triggered = (it.second.watched_bits() & EXEC_BIT) &&
+      exec_triggered = (it.second.watched_bits() & EXEC_BIT) &&
         (address_of_singlestep_start.is_null() ||
          it.first.start() == address_of_singlestep_start.to_data_ptr<void>()) &&
          watchpoint_triggered(debug_status,
                               it.second.debug_regs_for_exec_read);
-    if (write_triggered || read_triggered || exec_triggered) {
+    } else {
+      watchpoint_in_range = it.first.contains(hit_addr);
+    }
+    if (write_triggered || read_triggered || exec_triggered || watchpoint_in_range) {
       it.second.changed = true;
       triggered = true;
     }
@@ -1271,8 +1291,9 @@ void AddressSpace::unmap_internal(Task*, remote_ptr<void> addr,
     }
 
     if (m.local_addr) {
-      int ret =
-          munmap(m.local_addr + (rem.start() - m.map.start()), rem.size());
+      auto addr = m.local_addr + (rem.start() - m.map.start());
+      auto size = std::min(rem.size(), m.map.size() - (rem.start() - m.map.start()));
+      int ret = munmap(addr, size);
       if (ret < 0) {
         FATAL() << "Can't munmap";
       }
@@ -1540,6 +1561,10 @@ void AddressSpace::verify(Task* t) const {
 
   MemoryMap::const_iterator mem_it = mem.begin();
   KernelMapIterator kernel_it(t);
+  if (kernel_it.at_end()) {
+    LOG(debug) << "Task " << t->tid << " exited unexpectedly, ignoring";
+    return;
+  }
   while (!kernel_it.at_end() && mem_it != mem.end()) {
     KernelMapping km = kernel_it.current();
     ++kernel_it;
@@ -1603,7 +1628,7 @@ AddressSpace::AddressSpace(Task* t, const string& exe, uint32_t exec_count)
       stopping_breakpoint_table_entry_size_(0),
       first_run_event_(0) {
   // TODO: this is a workaround of
-  // https://github.com/mozilla/rr/issues/1113 .
+  // https://github.com/rr-debugger/rr/issues/1113 .
   if (session_->done_initial_exec()) {
     populate_address_space(t);
     DEBUG_ASSERT(!vdso_start_addr.is_null());
@@ -1639,6 +1664,8 @@ AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
       stopping_breakpoint_table_(o.stopping_breakpoint_table_),
       stopping_breakpoint_table_entry_size_(o.stopping_breakpoint_table_entry_size_),
       saved_auxv_(o.saved_auxv_),
+      saved_interpreter_base_(o.saved_interpreter_base_),
+      saved_ld_path_(o.saved_ld_path_),
       first_run_event_(0) {
   for (auto& m : mem) {
     // The original address space continues to have exclusive ownership of
@@ -2074,6 +2101,11 @@ static int random_addr_bits(SupportedArch arch) {
     // and only the bottom half is usable by user space
     case x86_64:
       return 47;
+    // Aarch64 has 48 bit address space, with user and kernel each getting
+    // their own 48 bits worth of address space at opposite end of the full
+    // 64-bit address space.
+    case aarch64:
+      return 48;
   }
 }
 
@@ -2229,6 +2261,43 @@ void AddressSpace::remove_stap_semaphore_range(Task* task, MemoryRange range) {
 
 bool AddressSpace::is_stap_semaphore(remote_ptr<uint16_t> addr) {
   return stap_semaphores.find(addr) != stap_semaphores.end();
+}
+
+void AddressSpace::fd_tables_changed() {
+  if (!session()->is_recording()) {
+    // All modifications are recorded during record
+    return;
+  }
+  if (!syscallbuf_enabled()) {
+    return;
+  }
+  DEBUG_ASSERT(task_set().size() != 0);
+  uint8_t fdt_uniform = true;
+  RecordTask* rt = nullptr;
+  // Find a suitable task
+  for (auto* t : task_set()) {
+    if (!t->is_dying()) {
+      rt = static_cast<RecordTask*>(t);
+    }
+  }
+  if (!rt) {
+    return;
+  }
+  auto fdt = rt->fd_table();
+  for (auto* t : task_set()) {
+    if (t->fd_table() != fdt) {
+      fdt_uniform = false;
+    }
+  }
+  auto addr = REMOTE_PTR_FIELD(rt->preload_globals, fdt_uniform);
+  bool ok = true;
+  if (rt->read_mem(addr, &ok) != fdt_uniform) {
+    if (!ok) {
+      return;
+    }
+    rt->write_mem(addr, fdt_uniform);
+    rt->record_local(addr, sizeof(fdt_uniform), &fdt_uniform);
+  }
 }
 
 } // namespace rr

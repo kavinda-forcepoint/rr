@@ -92,6 +92,7 @@ Scheduler::Scheduler(RecordSession& session)
       max_ticks_(DEFAULT_MAX_TICKS),
       must_run_task(nullptr),
       pretend_num_cores_(1),
+      in_exec_tgid(0),
       always_switch(false),
       enable_chaos(false),
       enable_poll(false),
@@ -476,9 +477,9 @@ static bool wait_any(pid_t& tid, WaitStatus& status, double timeout) {
  * that previously detached. Returns null if task that was waited for is not
  * managed by the current session (e.g. it is dead or was previously detached).
  */
-static RecordTask *find_waited_task(RecordSession& session, pid_t tid, WaitStatus status)
+static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatus status)
 {
-  RecordTask *waited = session.find_task(tid);
+  RecordTask* waited = session.find_task(tid);
   if (status.ptrace_event() == PTRACE_EVENT_EXEC) {
     if (!waited) {
       // The thread-group-leader died and now the exec'ing thread has
@@ -608,8 +609,9 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
 
   unlimited_ticks_mode = false;
 
-  RecordTask* next;
-  while (true) {
+  RecordTask* next = nullptr;
+  // While a threadgroup is in execve, treat all tasks as blocked.
+  while (!in_exec_tgid) {
     maybe_reset_high_priority_only_intervals(now);
     last_reschedule_in_high_priority_only_interval =
         in_high_priority_only_interval(now);
@@ -714,13 +716,23 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
       next = find_waited_task(session, tid, status);
       now = -1; // invalid, don't use
       LOG(debug) << "  " << tid << " changed status to " << status;
+      if (next) {
+        ASSERT(next,
+               next->may_be_blocked() ||
+                   status.ptrace_event() == PTRACE_EVENT_EXIT ||
+                   status.reaped())
+            << "Scheduled task should have been blocked";
+        ntasks_running--;
+        next->did_waitpid(status);
+        if (in_exec_tgid && next->tgid() != in_exec_tgid) {
+          // Some threadgroup is doing execve and this task isn't in
+          // that threadgroup. Don't schedule this task until the execve
+          // is complete.
+          LOG(debug) << "  ... but threadgroup " << in_exec_tgid << " is in execve, so ignoring for now";
+          next = nullptr;
+        }
+      }
     } while (!next);
-    ASSERT(next,
-           next->may_be_blocked() ||
-               status.ptrace_event() == PTRACE_EVENT_EXIT)
-        << "Scheduled task should have been blocked";
-    ntasks_running--;
-    next->did_waitpid(status);
     result.by_waitpid = true;
     must_run_task = next;
   }
@@ -784,6 +796,12 @@ void Scheduler::on_destroy(RecordTask* t) {
   if (t == current_) {
     current_ = nullptr;
   }
+  // When the last task in a threadgroup undergoing execve dies,
+  // the execve is over.
+  if (t->tgid() == in_exec_tgid &&
+      t->thread_group()->task_set().size() == 1) {
+    in_exec_tgid = 0;
+  }
 
   if (t->in_round_robin_queue) {
     auto iter =
@@ -823,7 +841,17 @@ void Scheduler::update_task_priority_internal(RecordTask* t, int value) {
   task_priority_set.insert(make_pair(t->priority, t));
 }
 
+static bool round_robin_scheduling_enabled() {
+  static bool disabled = getenv("RR_DISABLE_ROUND_ROBIN") != nullptr;
+  return !disabled;
+}
+
 void Scheduler::schedule_one_round_robin(RecordTask* t) {
+  if (!round_robin_scheduling_enabled()) {
+    LOG(debug) << "Would schedule round-robin because of task " << t->tid << ", but disabled";
+    return;
+  }
+
   LOG(debug) << "Scheduling round-robin because of task " << t->tid;
 
   ASSERT(t, t == current_);
@@ -854,6 +882,18 @@ void Scheduler::maybe_pop_round_robin_task(RecordTask* t) {
   task_round_robin_queue.pop_front();
   t->in_round_robin_queue = false;
   task_priority_set.insert(make_pair(t->priority, t));
+}
+
+void Scheduler::did_enter_execve(RecordTask* t) {
+  ASSERT(t, !in_exec_tgid) <<
+    "Entering execve while another execve is already happening in tgid " << in_exec_tgid;
+  in_exec_tgid = t->tgid();
+}
+
+void Scheduler::did_exit_execve(RecordTask* t) {
+  ASSERT(t, in_exec_tgid == t->tgid()) <<
+    "Exiting an execve we didn't know about";
+  in_exec_tgid = 0;
 }
 
 } // namespace rr

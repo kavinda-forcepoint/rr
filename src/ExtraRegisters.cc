@@ -42,6 +42,10 @@ static const uint8_t fxsave_387_ctrl_offsets[] = {
   6,  // DREG_64_FOP
 };
 
+static const int fip_offset = 8;
+static const int fdp_offset = 16;
+static const int mxcsr_offset = 24;
+
 struct RegData {
   int offset;
   int size;
@@ -155,7 +159,7 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
     RegData reg_data;
     if (DREG_V0 <= regno && regno <= DREG_V31) {
       reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, vregs[0]) +
-        ((regno - DREG_V0) * sizeof(__uint128_t)), sizeof(__uint128_t));
+        ((regno - DREG_V0) * 16), 16);
     } else if (regno == DREG_FPSR) {
       reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, fpsr),
                          sizeof(uint32_t));
@@ -210,6 +214,48 @@ uint64_t ExtraRegisters::read_xinuse(bool* defined) const {
   }
 
   memcpy(&ret, data_.data() + xinuse_offset, sizeof(ret));
+  return ret;
+}
+
+uint64_t ExtraRegisters::read_fip(bool* defined) const {
+  if (format_ != XSAVE) {
+    *defined = false;
+    return 0;
+  }
+
+  uint64_t ret;
+  memcpy(&ret, data_.data() + fip_offset, sizeof(ret));
+  return ret;
+}
+
+uint32_t ExtraRegisters::read_mxcsr(bool* defined) const {
+  if (format_ != XSAVE) {
+    *defined = false;
+    return 0;
+  }
+
+  uint32_t ret;
+  memcpy(&ret, data_.data() + mxcsr_offset, sizeof(ret));
+  return ret;
+}
+
+bool ExtraRegisters::clear_fip_fdp() {
+  if (format_ != XSAVE) {
+    return false;
+  }
+
+  bool ret = false;
+  uint64_t v;
+  memcpy(&v, data_.data() + fip_offset, sizeof(v));
+  if (v != 0) {
+    ret = true;
+    memset(data_.data() + fip_offset, 0, 8);
+  }
+  memcpy(&v, data_.data() + fdp_offset, sizeof(v));
+  if (v != 0) {
+    ret = true;
+    memset(data_.data() + fdp_offset, 0, 8);
+  }
   return ret;
 }
 
@@ -580,12 +626,27 @@ void ExtraRegisters::reset() {
     }
     uint64_t xinuse;
     if (data_.size() >= xinuse_offset + sizeof(xinuse)) {
+      memcpy(&xinuse, data_.data() + xinuse_offset, sizeof(xinuse));
+
       /* We have observed (Skylake, Linux 4.10) the system setting XINUSE's 0 bit
       * to indicate x87-in-use, at times unrelated to x87 actually being used.
       * Work around this by setting the bit unconditionally after exec.
       */
-      memcpy(&xinuse, data_.data() + xinuse_offset, sizeof(xinuse));
       xinuse |= 1;
+
+      /* If the system supports the PKRU feature, the PKRU feature bit must be
+      * set in order to get the kernel to properly update the PKRU register
+      * value. If this is not set, it has been observed that the PKRU register
+      * may occasionally contain "stale" values, particularly after involuntary
+      * context swtiches.
+      * Avoid this issue by setting the bit if the feature is supported by the
+      * CPU.
+      */
+      uint64_t pkru_bit = uint64_t(1) << xsave_feature_pkru;
+      if (xcr0() & pkru_bit) {
+        xinuse |= pkru_bit;
+      }
+
       memcpy(data_.data() + xinuse_offset, &xinuse, sizeof(xinuse));
     }
   } else {

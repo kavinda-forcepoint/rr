@@ -34,6 +34,7 @@
 #include "ProcFdDirMonitor.h"
 #include "ProcMemMonitor.h"
 #include "ProcStatMonitor.h"
+#include "RRPageMonitor.h"
 #include "ReplaySession.h"
 #include "ReplayTask.h"
 #include "SeccompFilterRewriter.h"
@@ -162,6 +163,7 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   int sys = r.original_syscallno();
   int flags = 0;
   if (Arch::clone == sys) {
+    // BLOCKED clone flags:
     // If we allow CLONE_UNTRACED then the child would escape from rr control
     // and we can't allow that.
     // Block CLONE_CHILD_CLEARTID because we'll emulate that ourselves.
@@ -169,14 +171,28 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
     // Block CLONE_NEW* from replay, any effects it had were dealt with during
     // recording.
     // Block CLONE_THREAD/CLONE_FILES - during replay each task is its own
-    // thread group/has its own fd table.
-    // We track what the membership was during record, but it's hard
-    // (and unnecessary) to replicate this kernel state during
+    // thread group/has its own fd table. We track what the membership was during
+    // record, but it's hard (and unnecessary) to replicate this kernel state during
     // replay.
+    // Block CLONE_PIDFD/CLONE_CHILD_SETTID/CLONE_PARENT_SETTID because we record these.
+    //
+    // ALLOWED clone flags:
+    // We allow CLONE_VM because address space sharing must not be broken.
+    // We allow CLONE_SETTLS because we must set %fs correctly if requested.
+    //
+    // IRRELEVANT clone flags:
+    // CLONE_SIGHAND/CLONE_SYSVSEM/CLONE_FS/CLONE_IO are irrelevant because we don't set signal handlers
+    // or use SYSV-semaphore objects during replay, or let it use the filesystem, or do I/O.
+    //
+    // CLONE_PARENT/CLONE_PTRACE ... they probably need work to work under rr.
     uintptr_t disallowed_clone_flags =
-        CLONE_UNTRACED | CLONE_CHILD_CLEARTID | CLONE_VFORK | CLONE_NEWIPC |
-        CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER |
-        CLONE_NEWUTS | CLONE_NEWCGROUP | CLONE_THREAD | CLONE_FILES;
+        CLONE_UNTRACED |
+        CLONE_CHILD_CLEARTID |
+        CLONE_VFORK |
+        CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER |
+        CLONE_NEWUTS | CLONE_NEWCGROUP |
+        CLONE_THREAD | CLONE_FILES |
+        CLONE_PIDFD | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID;
     flags = r.arg1();
     r.set_arg1(flags & ~disallowed_clone_flags);
   } else if (Arch::vfork == sys) {
@@ -678,6 +694,21 @@ static void process_mmap(ReplayTask* t, const TraceFrame& trace_frame,
         TraceReader::VALIDATE, TraceReader::CURRENT_TIME_ONLY, &extra_fds,
         &skip_monitoring_mapped_fd);
 
+      FileMonitor *fd_monitor = t->fd_table()->get_monitor(fd);
+      if (fd_monitor && fd_monitor->type() == FileMonitor::RRPage) {
+        if (offset_pages == 0 && !(flags & MAP_FIXED) &&
+            length <= 2*page_size() && addr == (RR_PAGE_ADDR - page_size())) {
+          // We only mapped the first page during record. Do the same here
+          length = page_size();
+        }
+        if (offset_pages == 1 && length == page_size() &&
+            addr == RR_PAGE_ADDR && t->vm()->has_rr_page()) {
+          // We skipped this during recording. Setting length to zero here
+          // will have the same effect.
+          length = 0;
+        }
+      }
+
       if (data.source == TraceReader::SOURCE_FILE &&
           data.file_size_bytes > data.data_offset_bytes) {
         struct stat real_file;
@@ -717,7 +748,7 @@ static void process_mmap(ReplayTask* t, const TraceFrame& trace_frame,
     // tracer and the tracee. Instead, only mappings that have
     // sufficiently many memory access from the tracer to require
     // acceleration should be shared.
-    if (!(MAP_SHARED & flags) && t->session().flags().share_private_mappings) {
+    if (length > 0 && !(MAP_SHARED & flags) && t->session().flags().share_private_mappings) {
       Session::make_private_shared(remote, t->vm()->mapping_of(addr));
     }
 
@@ -1005,6 +1036,8 @@ static void handle_opened_files(ReplayTask* t, int flags) {
       file_monitor = new SysCpuMonitor(t, o.path);
     } else if (is_proc_stat_file(o.path.c_str())) {
       file_monitor = new ProcStatMonitor(t, o.path);
+    } else if (is_rr_page_lib(o.path.c_str())) {
+      file_monitor = new RRPageMonitor();
     } else if (flags & O_DIRECT) {
       file_monitor = new FileMonitor();
     } else {
@@ -1149,14 +1182,14 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
     case Arch::set_thread_area: {
       // Using AutoRemoteSyscalls here fails for arch_prctl, not sure why.
       Registers r = t->regs();
-      r.set_syscallno(t->regs().original_syscallno());
+      r.set_syscallno(sys);
       r.set_ip(r.ip().decrement_by_syscall_insn_length(r.arch()));
       t->set_regs(r);
       if (sys == Arch::mprotect) {
         t->vm()->fixup_mprotect_growsdown_parameters(t);
       }
-      t->exit_syscall();
       t->enter_syscall();
+      t->exit_syscall();
       ASSERT(t, t->regs().syscall_result() == trace_regs.syscall_result());
       if (sys == Arch::mprotect) {
         Registers r2 = t->regs();

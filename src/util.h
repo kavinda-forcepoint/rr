@@ -24,6 +24,10 @@
  * so we can't use it. */
 #define SYSCALLBUF_DEFAULT_DESCHED_SIGNAL SIGPWR
 
+#ifndef SOL_NETLINK
+#define SOL_NETLINK 270
+#endif
+
 namespace rr {
 
 /*
@@ -46,6 +50,16 @@ enum Completion { COMPLETE, INCOMPLETE };
  * Returns a vector containing the raw data you can get from getauxval.
  */
 std::vector<uint8_t> read_auxv(Task* t);
+
+/**
+ * Returns the base address where the interpreter is mapped.
+ */
+remote_ptr<void> read_interpreter_base(std::vector<uint8_t> auxv);
+
+/**
+ * Returns a string containing the file name of the interpreter.
+ */
+std::string read_ld_path(Task* t, remote_ptr<void> interpreter_base);
 
 /**
  * Returns a vector containing the environment strings.
@@ -234,6 +248,17 @@ const CPUIDRecord* find_cpuid_record(const std::vector<CPUIDRecord>& records,
  */
 bool cpuid_compatible(const std::vector<CPUIDRecord>& trace_records);
 
+/**
+ * Return true if the CPU stores 0 for FIP/FDP in an XSAVE when no x87 exception
+ * is pending.
+ */
+bool cpu_has_xsave_fip_fdp_quirk();
+
+/**
+ * CPU only sets FDP when an unmasked x87 exception is generated.
+ */
+bool cpu_has_fdp_exception_only_quirk();
+
 struct CloneParameters {
   remote_ptr<void> stack;
   remote_ptr<int> ptid;
@@ -341,7 +366,7 @@ inline bool is_kernel_trap(int si_code) {
   /* XXX unable to find docs on which of these "should" be
    * right.  The SI_KERNEL code is seen in the int3 test, so we
    * at least need to handle that. */
-  return si_code == TRAP_TRACE || si_code == TRAP_BRKPT || si_code == SI_KERNEL;
+  return si_code == TRAP_TRACE || si_code == TRAP_BRKPT || si_code == TRAP_HWBKPT || si_code == SI_KERNEL;
 }
 
 enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
@@ -417,6 +442,12 @@ TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip);
 size_t trapped_instruction_len(TrappedInstruction insn);
 
 /**
+ * Certain instructions generate deterministic signals but also advance pc.
+ * Look *backwards* and see if this was one of them.
+ */
+bool is_advanced_pc_and_signaled_instruction(Task* t, remote_code_ptr ip);
+
+/**
  * BIND_CPU means binding to a randomly chosen CPU.
  * UNBOUND_CPU means not binding to a particular CPU.
  * A non-negative value means binding to the specific CPU number.
@@ -438,12 +469,7 @@ uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len);
 void write_all(int fd, const void* buf, size_t size);
 
 /* Like pwrite64(2) but we try to write all bytes by looping on short writes. */
-ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset);
-
-/* Like copy_file_range(2), but slower, because it buffers through this process
-  and without being completely broken on memfds. Also doesn't do short reads/writes.
-  XXX: It would be nice to fix this in the kernel. */
-ssize_t copy_file_range_all(int from_fd, off_t from_offset, int to_fd, off_t to_offset, size_t len);
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off64_t offset);
 
 /* Returns true if |path| is an accessible directory. Returns false if there
  * was an error.
@@ -490,6 +516,8 @@ enum NestedBehavior {
 };
 
 std::string find_exec_stub(SupportedArch arch);
+
+std::string find_helper_library(const char* basepath);
 
 static inline struct timeval to_timeval(double t) {
   struct timeval v;

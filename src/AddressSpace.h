@@ -213,6 +213,17 @@ enum WatchType {
   WATCH_READWRITE = 0x03
 };
 
+enum ArmWatchType {
+  ARM_WATCH_EXEC = 0x0,
+  ARM_WATCH_READ = 0x1,
+  ARM_WATCH_WRITE = 0x2,
+  ARM_WATCH_READWRITE = ARM_WATCH_READ | ARM_WATCH_WRITE
+};
+
+enum ArmPrivLevel {
+  ARM_PRIV_EL0 = 0x2
+};
+
 enum DebugStatus {
   DS_WATCHPOINT_ANY = 0xf,
   DS_SINGLESTEP = 1 << 14,
@@ -582,6 +593,7 @@ public:
    * are known to not be set on singlestep).
    */
   bool notify_watchpoint_fired(uintptr_t debug_status,
+      remote_ptr<void> hit_addr,
       remote_code_ptr address_of_singlestep_start);
   /**
    * Return true if any watchpoint has fired. Will keep returning true until
@@ -676,7 +688,25 @@ public:
 
   enum Traced { TRACED, UNTRACED };
   enum Privileged { PRIVILEGED, UNPRIVILEGED };
-  enum Enabled { RECORDING_ONLY, REPLAY_ONLY, RECORDING_AND_REPLAY };
+  /**
+   * Depending on which entry point this is and whether or not we're recording
+   * or replaying, the instruction in the rr page, may be something other than
+   * a syscall. This enum encodes the combination of instructions for each entry
+   * point:
+   *
+   *      Enabled         | Record  | Replay
+   * ---------------------|---------|-------
+   * RECORDING_ONLY       | syscall | nop
+   * REPLAY_ONLY          | nop     | syscall
+   * RECORDING_AND_REPLAY | syscall | syscall
+   * REPLAY_ASSIST        | syscall | int3
+   *
+   * The REPLAY_ASSIST is used for a syscall that is untraced during record (so
+   * we can save the context switch penalty), but requires us to apply side
+   * effects during replay. The int3 lets the replayer stop and apply these
+   * at the appropriate point.
+   */
+  enum Enabled { RECORDING_ONLY, REPLAY_ONLY, RECORDING_AND_REPLAY, REPLAY_ASSIST };
   static remote_code_ptr rr_page_syscall_exit_point(Traced traced,
                                                     Privileged privileged,
                                                     Enabled enabled,
@@ -698,9 +728,10 @@ public:
     SupportedArch arch, remote_code_ptr ip);
 
   /**
-   * Return a pointer to 8 bytes of 0xFF
+   * Return a pointer to 8 bytes of 0xFF.
+   * (Currently only set during record / not part of the ABI)
    */
-  static remote_ptr<uint8_t> rr_page_ff_bytes() { return RR_PAGE_FF_BYTES; }
+  static remote_ptr<uint8_t> rr_page_record_ff_bytes() { return RR_PAGE_FF_BYTES; }
 
   /**
    * Locate a syscall instruction in t's VDSO.
@@ -721,6 +752,12 @@ public:
 
   const std::vector<uint8_t>& saved_auxv() { return saved_auxv_; }
   void save_auxv(Task* t);
+
+  remote_ptr<void> saved_interpreter_base() { return saved_interpreter_base_; }
+  void save_interpreter_base(Task* t, std::vector<uint8_t> auxv);
+
+  std::string saved_ld_path() { return saved_ld_path_;}
+  void save_ld_path(Task* t, remote_ptr<void>);
 
   void read_mm_map(Task* t, struct prctl_mm_map* map);
 
@@ -793,6 +830,20 @@ public:
   // Also sets brk_ptr.
   void map_rr_page(AutoRemoteSyscalls& remote);
   void unmap_all_but_rr_page(AutoRemoteSyscalls& remote);
+
+  void erase_task(Task* t) {
+    this->HasTaskSet::erase_task(t);
+    if (task_set().size() != 0) {
+      fd_tables_changed();
+    }
+  }
+
+  /**
+   * Called when the set of different fd tables associated with tasks
+   * in this address space may have changed (e.g. a task changed its fd table,
+   * or a task got added or removed, etc).
+   */
+  void fd_tables_changed();
 
 private:
   struct Breakpoint;
@@ -1079,6 +1130,8 @@ private:
   int stopping_breakpoint_table_entry_size_;
 
   std::vector<uint8_t> saved_auxv_;
+  remote_ptr<void> saved_interpreter_base_;
+  std::string saved_ld_path_;
 
   /**
    * The time of the first event that ran code for a task in this address space.

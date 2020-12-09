@@ -101,6 +101,31 @@ vector<uint8_t> read_auxv(Task* t) {
   RR_ARCH_FUNCTION(read_auxv_arch, t->arch(), t);
 }
 
+remote_ptr<void> read_interpreter_base(std::vector<uint8_t> auxv) {
+  if (auxv.size() == 0 || (auxv.size() % sizeof(uint64_t) != 0)) {
+    // Corrupted or missing auxv
+    return nullptr;
+  }
+  remote_ptr<void> interpreter_base = nullptr;
+  for (size_t i = 0; i < (auxv.size() / sizeof(uint64_t)) - 1; i += 2) {
+    uint64_t* entry = ((uint64_t*)auxv.data())+i;
+    uint64_t kind = entry[0];
+    uint64_t value = entry[1];
+    if (kind == AT_BASE) {
+      interpreter_base = value;
+      break;
+    }
+  }
+  return interpreter_base;
+}
+
+std::string read_ld_path(Task* t, remote_ptr<void> interpreter_base) {
+  if (!interpreter_base || !t->vm()->has_mapping(interpreter_base)) {
+    return {};
+  }
+  return t->vm()->mapping_of(interpreter_base).map.fsname();
+}
+
 template <typename Arch> void patch_auxv_vdso_arch(RecordTask* t) {
   auto stack_ptr = auxv_ptr<Arch>(t);
   std::vector<uint8_t> v = read_auxv_arch<Arch>(t, stack_ptr);
@@ -451,6 +476,9 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
         FATAL() << "Segment " << parsed.start << "-" << parsed.end
                 << " changed to " << m.map << "??";
       }
+      // As |m| may have changed in the above for loop we need to update the
+      // |raw_map_line| too.
+      raw_map_line = m.map.str();
       ASSERT(t, m.map.end() == parsed.end)
           << "Segment " << parsed.start << "-" << parsed.end
           << " changed to " << m.map << "??";
@@ -537,6 +565,11 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
 }
 
 bool should_checksum(const Event& event, FrameTime time) {
+  FrameTime checksum = Flags::get().checksum;
+  if (Flags::CHECKSUM_NONE == checksum) {
+    return false;
+  }
+
   if (event.type() == EV_EXIT) {
     // Task is dead, or at least detached, and we can't read its memory safely.
     return false;
@@ -547,18 +580,13 @@ bool should_checksum(const Event& event, FrameTime time) {
     return false;
   }
 
-  FrameTime checksum = Flags::get().checksum;
-  bool is_syscall_exit =
-      EV_SYSCALL == event.type() && EXITING_SYSCALL == event.Syscall().state;
-
-  if (Flags::CHECKSUM_NONE == checksum) {
-    return false;
-  }
   if (Flags::CHECKSUM_ALL == checksum) {
-    return true;
+    // Don't checksum at syscall entry because we sometimes mutate syscall parameters there
+    // and that will cause false divergence
+    return EV_SYSCALL != event.type() || ENTERING_SYSCALL != event.Syscall().state;
   }
   if (Flags::CHECKSUM_SYSCALL == checksum) {
-    return is_syscall_exit;
+    return EV_SYSCALL == event.type() && EXITING_SYSCALL == event.Syscall().state;
   }
   /* |checksum| is a global time point. */
   return checksum <= time;
@@ -1005,7 +1033,7 @@ bool cpuid_faulting_works() {
   did_check_cpuid_faulting = true;
 
   // Test to see if CPUID faulting works.
-  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 0) != 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 0L) != 0) {
     LOG(debug) << "CPUID faulting not supported by kernel/hardware";
     return false;
   }
@@ -1032,7 +1060,7 @@ bool cpuid_faulting_works() {
   if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
     FATAL() << "Can't restore sighandler";
   }
-  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 1) < 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 1L) < 0) {
     FATAL() << "Can't restore ARCH_SET_CPUID";
   }
   return cpuid_faulting_ok;
@@ -1063,6 +1091,44 @@ bool cpuid_compatible(const vector<CPUIDRecord>& trace_records) {
   return cpu_type == trace_cpu_type;
 }
 
+bool cpu_has_xsave_fip_fdp_quirk() {
+#if defined(__i386__) || defined(__x86_64__)
+  uint64_t xsave_buf[576/sizeof(uint64_t)] __attribute__((aligned(64)));
+  xsave_buf[1] = 0;
+  asm volatile("finit\n"
+               "fld1\n"
+#if defined(__x86_64__)
+               "xsave64 %0\n"
+#else
+               "xsave %0\n"
+#endif
+               : "=m"(xsave_buf)
+               : "a"(1), "d"(0)
+               : "memory");
+  return !xsave_buf[1];
+#else
+  FATAL_X86_ONLY();
+  return false;
+#endif
+}
+
+bool cpu_has_fdp_exception_only_quirk() {
+#if defined(__i386__) || defined(__x86_64__)
+  uint32_t fenv_buf[7];
+  fenv_buf[5] = 0;
+  asm volatile("finit\n"
+               "fld1\n"
+               "fstenv %0\n"
+               : "=m"(fenv_buf)
+               :
+               : "memory");
+  return !fenv_buf[5];
+#else
+  FATAL_X86_ONLY();
+  return false;
+#endif
+}
+
 template <typename Arch>
 static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
   CloneParameters result;
@@ -1081,7 +1147,7 @@ static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
   int flags = (int)regs.arg1();
   // If these flags aren't set, the corresponding clone parameters may be
   // invalid pointers, so make sure they're ignored.
-  if (!(flags & CLONE_PARENT_SETTID)) {
+  if (!(flags & (CLONE_PARENT_SETTID | CLONE_PIDFD))) {
     result.ptid = nullptr;
   }
   if (!(flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID))) {
@@ -1183,11 +1249,31 @@ bool running_under_rr(bool cache) {
   static bool rr_check_done = false;
   if (!rr_check_done || !cache) {
     rr_check_done = true;
-    int ret = syscall(SYS_rrcall_check_presence, 0, 0, 0, 0, 0, 0);
-    DEBUG_ASSERT(ret == 0 || (ret == -1 && errno == ENOSYS));
+    int ret = syscall(SYS_rrcall_check_presence, (uintptr_t)0, (uintptr_t)0,
+      (uintptr_t)0, (uintptr_t)0, (uintptr_t)0, (uintptr_t)0);
+    if (ret > 0 || (ret < 0 && errno != ENOSYS)) {
+      FATAL() << "Unexpected result for rrcall_check_presence: " << ret;
+    }
     rr_under_rr = ret == 0;
   }
   return rr_under_rr;
+}
+
+string find_helper_library(const char *basepath)
+{
+  string lib_path = resource_path() + "lib64/rr/";
+  string file_name = lib_path + basepath;
+  if (access(file_name.c_str(), F_OK) == 0) {
+    return lib_path;
+  }
+  lib_path = resource_path() + "lib/rr/";
+  file_name = lib_path + basepath;
+  if (access(file_name.c_str(), F_OK) == 0) {
+    return lib_path;
+  }
+  // File does not exist. Assume install put it in LD_LIBRARY_PATH.
+  lib_path = "";
+  return lib_path;
 }
 
 vector<string> read_proc_status_fields(pid_t tid, const char* name,
@@ -1513,14 +1599,14 @@ static void replace_char(string& s, char c, char replacement) {
 static ScopedFd create_tmpfs_file(const string &real_name) {
   std::string name = real_name;
   replace_char(name, '/', '\\');
-  name = tmp_dir() + real_name;
+  name = string(tmp_dir()) + '/' + name;
   name = name.substr(0, 255);
 
   ScopedFd fd =
       open(name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0700);
   /* Remove the fs name so that we don't have to worry about
    * cleaning up this segment in error conditions. */
-  unlink(real_name.c_str());
+  unlink(name.c_str());
   return fd;
 }
 
@@ -1627,6 +1713,27 @@ size_t trapped_instruction_len(TrappedInstruction insn) {
 }
 
 /**
+ * Certain instructions generate deterministic signals but also advance pc.
+ * Look *backwards* and see if this was one of them.
+ */
+bool is_advanced_pc_and_signaled_instruction(Task* t, remote_code_ptr ip) {
+#if defined(__i386__) || defined(__x86_64__)
+  uint8_t insn[sizeof(int3_insn)];
+  ssize_t ret =
+      t->read_bytes_fallible(ip.to_data_ptr<uint8_t>() - sizeof(insn), sizeof(insn), insn);
+  if (ret < 0) {
+    return false;
+  }
+  size_t len = ret;
+  if (len >= sizeof(int3_insn) &&
+      !memcmp(insn, int3_insn, sizeof(int3_insn))) {
+    return true;
+  }
+#endif
+  return false;
+}
+
+/**
  * Read and parse the available CPU list then select a random CPU from the list.
  */
 static vector<int> get_cgroup_cpus() {
@@ -1713,7 +1820,9 @@ int choose_cpu(BindCPU bind_cpu, ScopedFd &cpu_lock_fd_out) {
     int err = fstat(cpu_lock_fd_out, &stat);
     DEBUG_ASSERT(err == 0);
     if (stat.st_size < get_num_cpus()) {
-      ftruncate(cpu_lock_fd_out, get_num_cpus());
+      if (ftruncate(cpu_lock_fd_out, get_num_cpus())) {
+        FATAL() << "Failed to resize locks file";
+      }
     }
   }
 
@@ -1842,7 +1951,7 @@ void write_all(int fd, const void* buf, size_t size) {
   }
 }
 
-ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset) {
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off64_t offset) {
   ssize_t written = 0;
   while (size > 0) {
     ssize_t ret = ::pwrite64(fd, buf, size, offset);
@@ -1857,38 +1966,6 @@ ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset) 
     size -= ret;
   }
   return written;
-}
-
-ssize_t copy_file_range_all(int from_fd, off_t from_offset, int to_fd,
-                            off_t to_offset, size_t len)
-{
-  char buf[4096];
-  size_t nwritten = 0;
-  while (true) {
-    ssize_t to_read = std::min(len - nwritten, sizeof(buf));
-    if (to_read == 0) {
-      break;
-    }
-    ssize_t read_ret = ::pread64(from_fd, buf, to_read, from_offset);
-    if (read_ret < 0) {
-      return read_ret;
-    }
-    else if (read_ret == 0) {
-      // We expected to read everything, but came up short, probably because
-      // what we tried to read wasn't mapped - let's call this EIO.
-      return -EIO;
-    }
-    from_offset += read_ret;
-    ssize_t write_ret = pwrite_all_fallible(to_fd, buf, read_ret, to_offset);
-    if (write_ret < 0) {
-      return write_ret;
-    } else if (write_ret < read_ret) {
-      return -EIO;
-    }
-    to_offset += write_ret;
-    nwritten += write_ret;
-  }
-  return nwritten;
 }
 
 bool is_directory(const char* path) {

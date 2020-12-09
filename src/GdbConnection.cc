@@ -654,6 +654,8 @@ bool GdbConnection::query(char* payload) {
     LOG(debug) << "gdb supports " << args;
 
     multiprocess_supported_ = strstr(args, "multiprocess+") != nullptr;
+    hwbreak_supported_ = strstr(args, "hwbreak+") != nullptr;
+    swbreak_supported_ = strstr(args, "swbreak+") != nullptr;
 
     stringstream supported;
     // Encourage gdb to use very large packets since we support any packet size
@@ -665,6 +667,8 @@ bool GdbConnection::query(char* payload) {
                  ";qXfer:siginfo:read+"
                  ";qXfer:siginfo:write+"
                  ";multiprocess+"
+                 ";hwbreak+"
+                 ";swbreak+"
                  ";ConditionalBreakpoints+"
                  ";vContSupported+";
     if (features().reverse_execution) {
@@ -730,7 +734,7 @@ bool GdbConnection::query(char* payload) {
       req.target = query_thread;
       req.mem().addr = strtoul(args, &args, 16);
       parser_assert(';' == *args++);
-      req.mem().len = strtoul(args, &args, 16);
+      req.mem().len = strtoull(args, &args, 16);
       parser_assert(';' == *args++);
       read_binary_data((const uint8_t*)args, inbuf.data() + packetend,
                        req.mem().data);
@@ -951,15 +955,22 @@ bool GdbConnection::process_vpacket(char* payload) {
     string event_str = decode_ascii_encoded_hex_str(arg1);
     char* endp;
     if (event_str[0] == 'c') {
-      int param = strtol(event_str.c_str() + 1, &endp, 0);
+      int64_t param = strtoll(event_str.c_str() + 1, &endp, 0);
       req.restart().type = RESTART_FROM_CHECKPOINT;
       req.restart().param_str = event_str.substr(1);
       req.restart().param = param;
       LOG(debug) << "next replayer restarting from checkpoint "
-                 << req.restart().param;
+                 << param;
+    } else if (event_str[0] == 't') {
+      int64_t param = strtoll(event_str.c_str() + 1, &endp, 0);
+      req.restart().type = RESTART_FROM_TICKS;
+      req.restart().param_str = event_str.substr(1);
+      req.restart().param = param;
+      LOG(debug) << "next replayer restarting from tick count "
+                 << param;
     } else {
       req.restart().type = RESTART_FROM_EVENT;
-      req.restart().param = strtol(event_str.c_str(), &endp, 0);
+      req.restart().param = strtoll(event_str.c_str(), &endp, 0);
       LOG(debug) << "next replayer advancing to event " << req.restart().param;
     }
     if (!endp || *endp != '\0') {
@@ -1446,30 +1457,24 @@ static int to_gdb_signum(int sig) {
 }
 
 void GdbConnection::send_stop_reply_packet(GdbThreadId thread, int sig,
-                                           uintptr_t watch_addr) {
+                                           const char *reason) {
   if (sig < 0) {
     write_packet("E01");
     return;
   }
-  char watch[1024];
-  if (watch_addr) {
-    snprintf(watch, sizeof(watch) - 1, "watch:%" PRIxPTR ";", watch_addr);
-  } else {
-    watch[0] = '\0';
-  }
   char buf[PATH_MAX];
   if (multiprocess_supported_) {
     snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
-           to_gdb_signum(sig), thread.pid, thread.tid, watch);
+           to_gdb_signum(sig), thread.pid, thread.tid, reason);
   } else {
     snprintf(buf, sizeof(buf) - 1, "T%02xthread:%02x;%s",
-           to_gdb_signum(sig), thread.tid, watch);
+           to_gdb_signum(sig), thread.tid, reason);
   }
   write_packet(buf);
 }
 
 void GdbConnection::notify_stop(GdbThreadId thread, int sig,
-                                uintptr_t watch_addr) {
+                                const char *reason) {
   DEBUG_ASSERT(req.is_resume_request() || req.type == DREQ_INTERRUPT);
 
   if (tgid != thread.pid) {
@@ -1479,7 +1484,11 @@ void GdbConnection::notify_stop(GdbThreadId thread, int sig,
     // the next stop we're willing to tell gdb about.
     return;
   }
-  send_stop_reply_packet(thread, sig, watch_addr);
+
+  if (!reason) {
+    reason = "";
+  }
+  send_stop_reply_packet(thread, sig, reason);
 
   // This isn't documented in the gdb remote protocol, but if we
   // don't do this, gdb will sometimes continue to send requests
@@ -1669,7 +1678,7 @@ void GdbConnection::reply_set_reg(bool ok) {
 void GdbConnection::reply_get_stop_reason(GdbThreadId which, int sig) {
   DEBUG_ASSERT(DREQ_GET_STOP_REASON == req.type);
 
-  send_stop_reply_packet(which, sig);
+  send_stop_reply_packet(which, sig, "");
 
   consume_request();
 }

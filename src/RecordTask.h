@@ -64,6 +64,7 @@ public:
               remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
               pid_t new_tid, pid_t new_rec_tid, uint32_t new_serial,
               Session* other_session = nullptr,
+              FdTable::shr_ptr new_fds = nullptr,
               ThreadGroup::shr_ptr new_tg = nullptr) override;
   virtual void post_wait_clone(Task* cloned_from, int flags) override;
   virtual void on_syscall_exit(int syscallno, SupportedArch arch,
@@ -493,7 +494,7 @@ public:
   size_t robust_list_len() const { return robust_futex_list_len; }
 
   /** Uses /proc so not trivially cheap. */
-  pid_t get_parent_pid();
+  pid_t get_parent_pid() const;
 
   /**
    * Return true if this is a "clone child" per the wait(2) man page.
@@ -546,7 +547,9 @@ public:
   void did_reach_zombie();
 
   // Is this task a container init? (which has special signal behavior)
-  bool is_container_init() { return own_namespace_rec_tid == 1; }
+  bool is_container_init() const { return tg->tgid_own_namespace == 1; }
+
+  bool waiting_for_pid_namespace_tasks_to_exit() const;
 
   /**
    * Called when this task is able to receive a SIGCHLD (e.g. because
@@ -597,6 +600,7 @@ private:
 
 public:
   Ticks ticks_at_last_recorded_syscall_exit;
+  remote_code_ptr ip_at_last_recorded_syscall_exit;
 
   // Scheduler state
 

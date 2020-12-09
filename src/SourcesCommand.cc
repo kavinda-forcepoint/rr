@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <map>
 
 #include "Command.h"
 #include "ElfReader.h"
@@ -50,7 +51,33 @@ protected:
   static SourcesCommand singleton;
 };
 
-SourcesCommand SourcesCommand::singleton("sources", " rr sources [<trace_dir>]\n");
+SourcesCommand SourcesCommand::singleton(
+    "sources",
+    " rr sources [<trace_dir>]\n"
+    "  --substitute=LIBRARY=PATH  When searching for the source to LIBRARY,\n"
+    "                             substitute PATH in place of the path stored\n"
+    "                             in the library's DW_AT_comp_dir property\n"
+    "                             for all compilation units.\n");
+
+class ExplicitSourcesCommand : public Command {
+public:
+  virtual int run(vector<string>& args) override;
+
+protected:
+  ExplicitSourcesCommand(const char* name, const char* help) : Command(name, help) {}
+
+  static ExplicitSourcesCommand singleton;
+};
+
+ExplicitSourcesCommand ExplicitSourcesCommand::singleton(
+    "explicit-sources",
+    " rr explicit-sources [<file>...]\n"
+    "  Like `rr sources` but instead of scanning the binary files used in a\n"
+    "  trace, scans an explicit list of files.\n"
+    "  --substitute=LIBRARY=PATH  When searching for the source to LIBRARY,\n"
+    "                             substitute PATH in place of the path stored\n"
+    "                             in the library's DW_AT_comp_dir property\n"
+    "                             for all compilation units.\n");
 
 static void parent_dir(string& s) {
   size_t p = s.rfind('/');
@@ -103,15 +130,24 @@ struct DwoInfo {
 static bool process_compilation_units(ElfFileReader& reader,
                                       const string& trace_relative_name,
                                       const string& original_file_name,
+                                      const string& comp_dir_substitution,
                                       set<string>* file_names, vector<DwoInfo>* dwos) {
   DwarfSpan debug_info = reader.dwarf_section(".debug_info");
   DwarfSpan debug_abbrev = reader.dwarf_section(".debug_abbrev");
   DwarfSpan debug_str = reader.dwarf_section(".debug_str");
+  DwarfSpan debug_str_offsets = reader.dwarf_section(".debug_str_offsets");
   DwarfSpan debug_line = reader.dwarf_section(".debug_line");
+  DwarfSpan debug_line_str = reader.dwarf_section(".debug_line_str");
   if (debug_info.empty() || debug_abbrev.empty() ||
       debug_str.empty() || debug_line.empty())  {
     return false;
   }
+
+  DebugStrSpans debug_strs = {
+    debug_str,
+    debug_str_offsets,
+    debug_line_str,
+  };
 
   string original_file_dir = original_file_name;
   parent_dir(original_file_dir);
@@ -123,19 +159,42 @@ static bool process_compilation_units(ElfFileReader& reader,
     if (!ok) {
       break;
     }
-    const char* comp_dir = cu.die().string_attr(DW_AT_comp_dir, debug_str, &ok);
+    int64_t str_offsets_base = cu.die().section_ptr_attr(DW_AT_str_offsets_base, &ok);
     if (!ok) {
       continue;
     }
-    const char* dwo_name = cu.die().string_attr(DW_AT_GNU_dwo_name, debug_str, &ok);
-    if (!ok) {
-      continue;
+    if (str_offsets_base > 0) {
+      cu.set_str_offsets_base(str_offsets_base);
+    } else {
+      cu.set_str_offsets_base(0);
     }
-    if (dwo_name) {
-      bool has_dwo_id;
-      uint64_t dwo_id = cu.die().unsigned_attr(DW_AT_GNU_dwo_id, &has_dwo_id, &ok);
+    const char* comp_dir;
+    if (!comp_dir_substitution.empty()) {
+      comp_dir = comp_dir_substitution.c_str();
+    } else {
+      comp_dir = cu.die().string_attr(cu, DW_AT_comp_dir, debug_strs, &ok);
       if (!ok) {
         continue;
+      }
+    }
+    const char* dwo_name = cu.die().string_attr(cu, DW_AT_GNU_dwo_name, debug_strs, &ok);
+    if (!ok || !dwo_name) {
+      dwo_name = cu.die().string_attr(cu, DW_AT_dwo_name, debug_strs, &ok);
+      if (!ok) {
+        continue;
+      }
+    }
+    if (dwo_name) {
+      bool has_dwo_id = false;
+      uint64_t dwo_id = cu.dwo_id();
+      if (dwo_id != 0) {
+        has_dwo_id = true;
+      }
+      if (!has_dwo_id) {
+        dwo_id = cu.die().unsigned_attr(DW_AT_GNU_dwo_id, &has_dwo_id, &ok);
+        if (!ok) {
+          continue;
+        }
       }
       if (has_dwo_id) {
         string c;
@@ -147,18 +206,18 @@ static bool process_compilation_units(ElfFileReader& reader,
         LOG(warn) << "DW_AT_GNU_dwo_name but not DW_AT_GNU_dwo_id";
       }
     }
-    const char* source_file_name = cu.die().string_attr(DW_AT_name, debug_str, &ok);
+    const char* source_file_name = cu.die().string_attr(cu, DW_AT_name, debug_strs, &ok);
     if (!ok) {
       continue;
     }
     if (source_file_name) {
       resolve_file_name(original_file_dir.c_str(), comp_dir, nullptr, source_file_name, file_names);
     }
-    intptr_t stmt_list = cu.die().lineptr_attr(DW_AT_stmt_list, &ok);
+    intptr_t stmt_list = cu.die().section_ptr_attr(DW_AT_stmt_list, &ok);
     if (stmt_list < 0 || !ok) {
       continue;
     }
-    DwarfLineNumberTable lines(debug_line.subspan(stmt_list), &ok);
+    DwarfLineNumberTable lines(cu, debug_line.subspan(stmt_list), debug_strs, &ok);
     if (!ok) {
       continue;
     }
@@ -207,20 +266,61 @@ static bool try_auxiliary_file(ElfFileReader& trace_file_reader,
     return false;
   }
   string full_file_name;
+  ScopedFd fd;
   if (aux_file_name.c_str()[0] == '/') {
     full_file_name = aux_file_name;
+    fd = ScopedFd(full_file_name.c_str(), O_RDONLY);
+    if (!fd.is_open()) {
+      LOG(warn) << "Can't find external debuginfo file " << full_file_name;
+      return false;
+    }
   } else {
+    // Skip first trying the current directory. That's unlikely to be correct.
+
+    // Try in the same directory as the original file.
     string original_file_dir = original_file_name;
     parent_dir(original_file_dir);
     full_file_name = original_file_dir + "/" + aux_file_name;
     normalize_file_name(full_file_name);
-  }
-
-  ScopedFd fd(full_file_name.c_str(), O_RDONLY);
-  if (!fd.is_open()) {
+    fd = ScopedFd(full_file_name.c_str(), O_RDONLY);
+    if (fd.is_open()) {
+      goto found;
+    }
     LOG(warn) << "Can't find external debuginfo file " << full_file_name;
+
+    // Next try in a subdirectory called .debug
+    full_file_name = original_file_dir + "/.debug/" + aux_file_name;
+    normalize_file_name(full_file_name);
+    fd = ScopedFd(full_file_name.c_str(), O_RDONLY);
+    if (fd.is_open()) {
+      goto found;
+    }
+    LOG(warn) << "Can't find external debuginfo file " << full_file_name;
+
+    // Then try in /usr/lib/debug
+    full_file_name = "/usr/lib/debug/" + aux_file_name;
+    normalize_file_name(full_file_name);
+    fd = ScopedFd(full_file_name.c_str(), O_RDONLY);
+    if (fd.is_open()) {
+      goto found;
+    }
+    LOG(warn) << "Can't find external debuginfo file " << full_file_name;
+
+    // Try in an appropriate subdirectory of /usr/lib/debug
+    full_file_name = "/usr/lib/debug" + original_file_dir + "/" + aux_file_name;
+    normalize_file_name(full_file_name);
+    fd = ScopedFd(full_file_name.c_str(), O_RDONLY);
+    if (fd.is_open()) {
+      goto found;
+    }
+    LOG(warn) << "Can't find external debuginfo file " << full_file_name;
+
+    // If none of those worked, give up.
+    LOG(warn) << "Exhausted auxilliary debuginfo search locations for " << aux_file_name;
     return false;
   }
+
+found:
   LOG(info) << "Examining external " << full_file_name;
   ElfFileReader reader(fd);
   if (!reader.ok()) {
@@ -232,7 +332,7 @@ static bool try_auxiliary_file(ElfFileReader& trace_file_reader,
     LOG(warn) << "Main ELF binary has no build ID!";
     return false;
   }
-  if (!process_compilation_units(reader, trace_relative_name, original_file_name, file_names, dwos)) {
+  if (!process_compilation_units(reader, trace_relative_name, original_file_name, {}, file_names, dwos)) {
     LOG(warn) << "No debuginfo!";
     return false;
   }
@@ -409,46 +509,39 @@ static bool starts_with(const string& s, const string& prefix) {
   return strncmp(s.c_str(), prefix.c_str(), prefix.size()) == 0;
 }
 
-static int sources(const string& trace_dir) {
-  TraceReader trace(trace_dir);
-  DIR* files = opendir(trace.dir().c_str());
-  if (!files) {
-    FATAL() << "Can't open trace dir";
-  }
-
-  // (Trace file name, original file name) pairs
-  map<string, string> binary_file_names;
-  while (true) {
-    TraceReader::MappedData data;
-    bool found;
-    KernelMapping km = trace.read_mapped_region(
-        &data, &found, TraceReader::VALIDATE, TraceReader::ANY_TIME);
-    if (!found) {
-      break;
-    }
-    if (data.source == TraceReader::SOURCE_FILE) {
-      binary_file_names.insert(make_pair(move(data.file_name), km.fsname()));
-    }
-  }
-
+static int sources(const map<string, string>& binary_file_names, const map<string, string>& comp_dir_substitutions, bool is_explicit) {
   vector<string> relevant_binary_names;
   set<string> file_names;
   set<ExternalDebugInfo> external_debug_info;
   vector<DwoInfo> dwos;
   for (auto& pair : binary_file_names) {
-    ScopedFd fd(pair.first.c_str(), O_RDONLY);
+    string trace_relative_name = pair.first;
+    string original_name = pair.second;
+    const char* file_name = is_explicit ? original_name.c_str() : trace_relative_name.c_str();
+    ScopedFd fd(file_name, O_RDONLY);
     if (!fd.is_open()) {
-      FATAL() << "Can't open " << pair.first;
+      FATAL() << "Can't open " << file_name;
     }
-    LOG(info) << "Examining " << pair.first;
+    LOG(info) << "Examining " << file_name;
     ElfFileReader reader(fd);
     if (!reader.ok()) {
       LOG(info) << "Probably not an ELF file, skipping";
       continue;
     }
-    string trace_relative_name = pair.first;
-    base_name(trace_relative_name);
-    bool has_source_files = process_compilation_units(reader, trace_relative_name, pair.second, &file_names, &dwos);
+    if (!is_explicit) {
+      base_name(trace_relative_name);
+    }
+    base_name(original_name);
+    bool has_source_files;
+    LOG(debug) << "Looking for comp_dir substitutions for " << original_name;
+    auto it = comp_dir_substitutions.find(original_name);
+    if (it != comp_dir_substitutions.end()) {
+      LOG(debug) << "\tFound comp_dir substitution " << it->second;
+      has_source_files = process_compilation_units(reader, trace_relative_name, pair.second, it->second, &file_names, &dwos);
+    } else {
+      LOG(debug) << "\tNone found";
+      has_source_files = process_compilation_units(reader, trace_relative_name, pair.second, {}, &file_names, &dwos);
+    }
 
     Debuglink debuglink = reader.read_debuglink();
     has_source_files |= try_auxiliary_file(reader, trace_relative_name, pair.second,
@@ -561,17 +654,103 @@ static int sources(const string& trace_dir) {
   return 0;
 }
 
-int SourcesCommand::run(vector<string>& args) {
-  while (parse_global_option(args)) {
+static bool parse_sources_option(vector<string>& args, map<string, string>& comp_dir_substitutions) {
+  if (parse_global_option(args)) {
+    return true;
   }
 
+  static const OptionSpec options[] = {
+    { 0, "substitute", HAS_PARAMETER }
+  };
+
+  ParsedOption opt;
+  if (!Command::parse_option(args, options, &opt)) {
+    return false;
+  }
+
+  switch (opt.short_name) {
+    case 0: {
+      auto pos = opt.value.find_first_of('=');
+      if (pos != string::npos) {
+        auto k = opt.value.substr(0, pos);
+        auto v = opt.value.substr(pos+1);
+        comp_dir_substitutions.insert(std::pair<string, string>(k, v));
+      }
+      break;
+    }
+  }
+
+  return true;
+}
+
+int SourcesCommand::run(vector<string>& args) {
+  map<string, string> comp_dir_substitutions;
+  while (parse_sources_option(args, comp_dir_substitutions)) {
+  }
+
+  // (Trace file name, original file name) pairs
   string trace_dir;
   if (!parse_optional_trace_dir(args, &trace_dir)) {
     print_help(stderr);
     return 1;
   }
 
-  return sources(trace_dir);
+  TraceReader trace(trace_dir);
+  DIR* files = opendir(trace.dir().c_str());
+  if (!files) {
+    FATAL() << "Can't open trace dir";
+  }
+
+  map<string, string> binary_file_names;
+  while (true) {
+    TraceReader::MappedData data;
+    bool found;
+    KernelMapping km = trace.read_mapped_region(
+        &data, &found, TraceReader::VALIDATE, TraceReader::ANY_TIME);
+    if (!found) {
+      break;
+    }
+    if (data.source == TraceReader::SOURCE_FILE) {
+      binary_file_names.insert(make_pair(move(data.file_name), km.fsname()));
+    }
+  }
+
+  return sources(binary_file_names, comp_dir_substitutions, false);
+}
+
+int ExplicitSourcesCommand::run(vector<string>& args) {
+  map<string, string> comp_dir_substitutions;
+  while (parse_sources_option(args, comp_dir_substitutions)) {
+  }
+
+  // (Trace file name, original file name) pairs
+  map<string, string> binary_file_names;
+  for (auto arg : args) {
+    struct stat statbuf;
+    int ret = stat(arg.c_str(), &statbuf);
+    if (ret < 0) {
+      FATAL() << "Failed to stat `" << arg << "`";
+    }
+    if (!S_ISREG(statbuf.st_mode)) {
+      continue;
+    }
+
+    ScopedFd fd = ScopedFd(arg.c_str(), O_RDONLY, 0);
+    if (!fd.is_open()) {
+      LOG(error) << "Failed to open `" << arg << "`";
+      return 1;
+    }
+
+    ElfFileReader reader(fd);
+    auto buildid = reader.read_buildid();
+    if (buildid.empty()) {
+      LOG(warn) << "No build-id for `" << arg << "`";
+      continue;
+    }
+    binary_file_names.insert(make_pair(move(buildid), arg));
+  }
+
+  return sources(binary_file_names, comp_dir_substitutions, true);
 }
 
 } // namespace rr

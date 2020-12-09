@@ -104,14 +104,19 @@ templates = {
         Field('syscall_hook_trampoline', 4),
     ),
     'X86VsyscallMonkeypatch': AssemblyTemplate(
-        RawBytes(0x53),         # push %ebx
         RawBytes(0xb8),         # mov $syscall_number,%eax
         Field('syscall_number', 4),
+        RawBytes(0xe8),         # call $X86VsyscallMonkeypatchShared
+        Field('vsyscall_monkeypatch_shared', 4),
+        RawBytes(0xc3),
+    ),
+    'X86VsyscallMonkeypatchShared': AssemblyTemplate(
         # __vdso functions use the C calling convention, so
         # we have to set up the syscall parameters here.
         # No x86-32 __vdso functions take more than two parameters.
-        RawBytes(0x8b, 0x5c, 0x24, 0x08), # mov 0x8(%esp),%ebx
-        RawBytes(0x8b, 0x4c, 0x24, 0x0c), # mov 0xc(%esp),%ecx
+        RawBytes(0x53),         # push %ebx
+        RawBytes(0x8b, 0x5c, 0x24, 0x0c), # mov 12(%esp),%ebx
+        RawBytes(0x8b, 0x4c, 0x24, 0x10), # mov 16(%esp),%ecx
         RawBytes(0xcd, 0x80),   # int $0x80
         # pad with NOPs to make room to dynamically patch the syscall
         # with a call to the preload library, once syscall buffering
@@ -137,6 +142,10 @@ templates = {
         Field('trampoline_relative_addr', 4)
     ),
 
+    'X64CallMonkeypatch': AssemblyTemplate(
+        RawBytes(0xe8),         # call $relative_addr
+        Field('relative_addr', 4),
+    ),
     'X64JumpMonkeypatch': AssemblyTemplate(
         RawBytes(0xe9),         # jmp $relative_addr
         Field('relative_addr', 4),
@@ -187,11 +196,13 @@ templates = {
         RawBytes(0xd9, 0x74, 0x24, 0xe0),                               # fstenv -32(%rsp)
         RawBytes(0x48, 0xc7, 0x44, 0x24, 0xf4, 0x00, 0x00, 0x00, 0x00), # movq $0,-12(%rsp)
         RawBytes(0xd9, 0x64, 0x24, 0xe0),                               # fldenv -32(%rsp)
-        RawBytes(0x53),                   # push %rbx
+        RawBytes(0x48, 0x87, 0x1c, 0x24), # xchg (%rsp),%rbx
+        # r11 is destroyed anyways by _dl_runtime_resolve, so we can use it here.
+        RawBytes(0x49, 0x89, 0xdb),       # mov %rbx,%r11
         RawBytes(0x48, 0x89, 0xe3),       # mov %rsp,%rbx
         RawBytes(0x48, 0x83, 0xe4, 0xc0), # and $0xffffffffffffffc0,%rsp
-        RawBytes(0xe9),                   # jmp $relative_addr
-        Field('relative_addr', 4),
+        RawBytes(0x41, 0x53),             # push %r11
+        RawBytes(0xc3),                   # ret
     ),
     'X64EndBr': AssemblyTemplate(
         RawBytes(0xf3, 0x0f, 0x1e, 0xfa)

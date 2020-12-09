@@ -112,6 +112,7 @@ struct FcntlConstants {
     SETPIPE_SZ = 0x400 + 7,
     GETPIPE_SZ = 0x400 + 8,
     ADD_SEALS = 0x400 + 9,
+    GET_SEALS = 0x400 + 10,
     GET_RW_HINT = 0x400 + 11,
     SET_RW_HINT = 0x400 + 12,
     GET_FILE_RW_HINT = 0x400 + 13,
@@ -2103,6 +2104,11 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
   };
   typedef struct user_pt_regs user_regs_struct;
 
+#if defined (__i386__)
+  typedef struct {
+    uint64_t parts[2];
+  } __uint128_t;
+#endif
   struct user_fpsimd_state {
     __uint128_t vregs[32];
     uint32_t fpsr;
@@ -2110,6 +2116,27 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     uint32_t rr_reserved[2];
   };
   typedef struct user_fpsimd_state user_fpregs_struct;
+
+  struct hw_breakpoint_ctrl {
+    uint32_t enabled:1;
+    uint32_t priv:2;
+    uint32_t type:2;
+    uint32_t length:8;
+    uint32_t _pad:19;
+  };
+  static_assert(sizeof(hw_breakpoint_ctrl) == sizeof(uint32_t), "Size mismatch");
+
+  struct hw_bp {
+    uint64_t addr;
+    hw_breakpoint_ctrl ctrl;
+    uint32_t _pad;
+  };
+
+  struct user_hwdebug_state {
+    uint32_t dbg_info;
+    uint32_t pad;
+    struct hw_bp dbg_regs[16];
+  };
 
   struct sigcontext {
     __u64 fault_addr;
@@ -2154,12 +2181,12 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
  * and if so, return the architecture for which this is a syscall in *arch.
  */
 bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
-                                  SupportedArch* arch);
+                                  SupportedArch* arch, bool* ok=nullptr);
 
 /**
  * Return true if |ptr| in task |t| points to an invoke-syscall instruction.
  */
-bool is_at_syscall_instruction(Task* t, remote_code_ptr ptr);
+bool is_at_syscall_instruction(Task* t, remote_code_ptr ptr, bool* ok=nullptr);
 
 /**
  * Return the code bytes of an invoke-syscall instruction. The vector must
@@ -2197,6 +2224,9 @@ void set_arch_siginfo(const siginfo_t& siginfo, SupportedArch a, void* dest,
                       size_t dest_size);
 
 size_t sigaction_sigset_size(SupportedArch arch);
+
+size_t user_regs_struct_size(SupportedArch arch);
+size_t user_fpregs_struct_size(SupportedArch arch);
 
 #if defined(__i386__)
 typedef X86Arch NativeArch;

@@ -158,6 +158,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
                        SupportedArch a)
     : Task(session, _tid, _tid, serial, a),
       ticks_at_last_recorded_syscall_exit(0),
+      ip_at_last_recorded_syscall_exit(nullptr),
       time_at_start_of_last_timeslice(0),
       priority(0),
       in_round_robin_queue(false),
@@ -289,11 +290,14 @@ TraceWriter& RecordTask::trace_writer() const {
 Task* RecordTask::clone(CloneReason reason, int flags, remote_ptr<void> stack,
                         remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
                         pid_t new_tid, pid_t new_rec_tid, uint32_t new_serial,
-                        Session* other_session, ThreadGroup::shr_ptr new_tg) {
+                        Session* other_session, FdTable::shr_ptr new_fds,
+                        ThreadGroup::shr_ptr new_tg) {
   ASSERT(this, reason == Task::TRACEE_CLONE);
-  ASSERT(this, new_tg == nullptr);
+  ASSERT(this, !new_fds);
+  ASSERT(this, !new_tg);
   Task* t = Task::clone(reason, flags, stack, tls, cleartid_addr, new_tid,
-                        new_rec_tid, new_serial, other_session, new_tg);
+                        new_rec_tid, new_serial, other_session, new_fds,
+                        new_tg);
   if (t->session().is_recording()) {
     RecordTask* rt = static_cast<RecordTask*>(t);
     if (CLONE_CLEARTID & flags) {
@@ -590,7 +594,7 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
     // have much choice, signal injection won't work if we block the signal.
     // We leave rr signals unblocked. TIME_SLICE_SIGNAL has to be unblocked
     // because blocking it seems to cause problems for some hardware/kernel
-    // configurations (see https://github.com/mozilla/rr/issues/1979),
+    // configurations (see https://github.com/rr-debugger/rr/issues/1979),
     // causing them to stop counting events.
     sig_set_t sigset = ~session().rr_signal_mask();
     if (sig) {
@@ -1270,6 +1274,7 @@ void RecordTask::verify_signal_states() {
     // This task isn't real
     return;
   }
+
   auto results = read_proc_status_fields(tid, "SigBlk", "SigIgn", "SigCgt");
   ASSERT(this, results.size() == 3);
   sig_set_t blocked = strtoull(results[0].c_str(), NULL, 16);
@@ -1288,6 +1293,16 @@ void RecordTask::verify_signal_states() {
       ASSERT(this, !!(blocked & mask) == is_sig_blocked(sig))
           << signal_name(sig)
           << ((blocked & mask) ? " is blocked" : " is not blocked");
+      if (sig == SIGCHLD && is_container_init() && (ignored & mask)) {
+        // pid-1-in-its-own-pid-namespace tasks can have their SIGCHLD set
+        // to "ignore" when they die (in zap_pid_ns_processes). We may
+        // not have observed anything relating to this death yet. We could
+        // probe to ensure it's already marked as a zombie but why bother.
+        // XXX arguably we should actually change our disposition here but
+        // it would only matter in certain very weird cases: a vfork() where
+        // the child process is pid-1 in its namespace.
+        continue;
+      }
       auto disposition = sighandlers->get(sig).disposition();
       ASSERT(this, !!(ignored & mask) == (disposition == SIGNAL_IGNORE))
           << signal_name(sig)
@@ -1759,6 +1774,15 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
     checksum_process_memory(this, current_time);
   }
 
+  if (trace_writer().clear_fip_fdp()) {
+    const ExtraRegisters* maybe_extra = extra_regs_fallible();
+    if (maybe_extra) {
+      ExtraRegisters extra_registers = *maybe_extra;
+      extra_registers.clear_fip_fdp();
+      set_extra_regs(extra_registers);
+    }
+  }
+
   const ExtraRegisters* extra_registers = nullptr;
   if (ev.record_regs()) {
     if (!registers) {
@@ -1771,6 +1795,7 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
 
   if (ev.is_syscall_event() && ev.Syscall().state == EXITING_SYSCALL) {
     ticks_at_last_recorded_syscall_exit = tick_count();
+    ip_at_last_recorded_syscall_exit = registers->ip();
   }
 
   trace_writer().write_frame(this, ev, registers, extra_registers);
@@ -1888,7 +1913,7 @@ void RecordTask::kill_if_alive() {
   }
 }
 
-pid_t RecordTask::get_parent_pid() { return get_ppid(tid); }
+pid_t RecordTask::get_parent_pid() const { return get_ppid(tid); }
 
 void RecordTask::set_tid_and_update_serial(pid_t tid,
                                            pid_t own_namespace_tid) {
@@ -1896,6 +1921,21 @@ void RecordTask::set_tid_and_update_serial(pid_t tid,
   this->tid = rec_tid = tid;
   serial = session().next_task_serial();
   own_namespace_rec_tid = own_namespace_tid;
+}
+
+bool RecordTask::waiting_for_pid_namespace_tasks_to_exit() const {
+  if (tg->tgid_own_namespace != 1 || thread_group()->task_set().size() > 1) {
+    return false;
+  }
+  // This is the last thread of pid-1 for its namespace. See if there
+  // are any other tasks in the pid namespace. We can just check if there
+  // are any threadgroup children of our threadgroup.
+  for (auto p : session().thread_group_map()) {
+    if (p.second->parent() == tg.get()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 template <typename Arch>

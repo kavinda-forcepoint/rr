@@ -43,6 +43,7 @@ RerunCommand RerunCommand::singleton(
     "  -f, --function=<ADDR>      when starting tracing, push sentinel return\n"
     "                             address and jump to <ADDR> to fake call\n"
     "  --singlestep=<REGS>        dump <REGS> after each singlestep\n"
+    "  --event-regs=<REGS>        dump <REGS> after each event\n"
     "  -r, --raw                  dump registers in raw format\n"
     "  -s, --trace-start=<EVENT>  start tracing at <EVENT>\n"
     "  -u, --cpu-unbound          allow replay to run on any CPU. Default is\n"
@@ -50,9 +51,9 @@ RerunCommand RerunCommand::singleton(
     "                             Note that this may diverge from the recording\n"
     "                             in some cases.\n"
     "\n"
-    "<REGS> is a comma-separated sequence of 'event','icount','ip','flags',\n"
-    "'gp_x16','xmm_x16','ymm_x16'. For the 'x16' cases, we always output 16,\n"
-    "values, the latter 8 of which are zero for x86-32. GP registers are in\n"
+    "<REGS> is a comma-separated sequence of 'event','icount','ip','ticks',\n"
+    "'flags','gp_x16','xmm_x16','ymm_x16'. For the 'x16' cases, we always output\n"
+    "16 values, the latter 8 of which are zero for x86-32. GP registers are in\n"
     "architectural order (AX,CX,DX,BX,SP,BP,SI,DI,R8-R15). All data is output\n"
     "in little-endian binary format; records are separated by \\n. String\n"
     "instruction repetitions are treated as a single instruction if not\n"
@@ -73,6 +74,10 @@ enum TraceFieldKind {
   TRACE_GP_REG,            // outputs 64-bit value
   TRACE_XMM_REG,           // outputs 128-bit value
   TRACE_YMM_REG,           // outputs 256-bit value
+  TRACE_FIP,               // outputs 64-bit value
+  TRACE_TID,               // outputs 32-bit value
+  TRACE_MXCSR,             // outputs 32-bit value
+  TRACE_TICKS,             // outputs 64-bit value
 };
 struct TraceField {
   TraceFieldKind kind;
@@ -84,6 +89,7 @@ struct RerunFlags {
   FrameTime trace_end;
   remote_code_ptr function;
   vector<TraceField> singlestep_trace;
+  vector<TraceField> event_trace;
   bool raw;
   bool cpu_unbound;
 
@@ -190,13 +196,15 @@ static uint64_t seg_reg(const Registers& regs, uint8_t index) {
 }
 
 static void print_regs(Task* t, FrameTime event, uint64_t instruction_count,
-                       const RerunFlags& flags, FILE* out) {
+                       const RerunFlags& flags, const vector<TraceField>& fields, FILE* out) {
+  if (fields.empty()) {
+    return;
+  }
   union {
     NativeArch::user_regs_struct gp_regs;
     uintptr_t regs_values[sizeof(struct user_regs_struct) / sizeof(uintptr_t)];
   };
   bool got_gp_regs = false;
-  const vector<TraceField>& fields = flags.singlestep_trace;
   bool first = true;
 
   for (auto& field : fields) {
@@ -335,6 +343,26 @@ static void print_regs(Task* t, FrameTime event, uint64_t instruction_count,
         print_value(buf, value, sizeof(value), flags, out);
         break;
       }
+      case TRACE_FIP: {
+        bool defined;
+        uint64_t value = t->extra_regs().read_fip(&defined);
+        print_value("fip", &value, sizeof(value), flags, out);
+        break;
+      }
+      case TRACE_MXCSR: {
+        bool defined;
+        uint32_t value = t->extra_regs().read_mxcsr(&defined);
+        print_value("mxcsr", &value, sizeof(value), flags, out);
+        break;
+      }
+      case TRACE_TID:
+        print_value("tid", &t->rec_tid, sizeof(t->rec_tid), flags, out);
+        break;
+      case TRACE_TICKS: {
+        Ticks ticks = t->tick_count();
+        print_value("ticks", &ticks, sizeof(ticks), flags, out);
+        break;
+      }
     }
   }
 
@@ -407,6 +435,14 @@ static bool parse_regs(const string& value, vector<TraceField>* out) {
       out->push_back({ TRACE_SEG_REG, (uint8_t)find_seg_reg(reg) });
     } else if (reg == "xinuse") {
       out->push_back({ TRACE_XINUSE, 0 });
+    } else if (reg == "fip") {
+      out->push_back({ TRACE_FIP, 0 });
+    } else if (reg == "mxcsr") {
+      out->push_back({ TRACE_MXCSR, 0});
+    } else if (reg == "tid") {
+      out->push_back({ TRACE_TID, 0 });
+    } else if (reg == "ticks") {
+      out->push_back({ TRACE_TICKS, 0 });
     } else {
       fprintf(stderr, "Unknown register '%s'\n", reg.c_str());
       return false;
@@ -422,6 +458,7 @@ static bool parse_rerun_arg(vector<string>& args, RerunFlags& flags) {
 
   static const OptionSpec options[] = {
     { 1, "singlestep", HAS_PARAMETER },
+    { 2, "event-regs", HAS_PARAMETER },
     { 'e', "trace-end", HAS_PARAMETER },
     { 'f', "function", HAS_PARAMETER },
     { 'r', "raw", NO_PARAMETER },
@@ -436,6 +473,11 @@ static bool parse_rerun_arg(vector<string>& args, RerunFlags& flags) {
   switch (opt.short_name) {
     case 1:
       if (!parse_regs(opt.value, &flags.singlestep_trace)) {
+        return false;
+      }
+      break;
+    case 2:
+      if (!parse_regs(opt.value, &flags.event_trace)) {
         return false;
       }
       break;
@@ -520,7 +562,7 @@ static void run_diversion_function(ReplaySession& replay, Task* task,
   while (true) {
     DiversionSession::DiversionResult result =
         diversion_session->diversion_step(t, cmd);
-    print_regs(t, 0, 0, flags, stdout);
+    print_regs(t, 0, 0, flags, flags.singlestep_trace, stdout);
     if (result.break_status.signal) {
       if (result.break_status.signal->si_signo == SIGSEGV &&
           result.break_status.signal->si_addr == (void*)sentinel_ret_address) {
@@ -544,6 +586,12 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
   ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir, session_flags(flags));
   uint64_t instruction_count_within_event = 0;
   bool done_first_step = false;
+  bool need_to_singlestep = !flags.singlestep_trace.empty();
+  for (auto& v : flags.event_trace) {
+    if (v.kind == TRACE_INSTRUCTION_COUNT) {
+      need_to_singlestep = true;
+    }
+  }
 
   // Now that we've spawned the replay, raise our resource limits if
   // possible.
@@ -553,6 +601,7 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
     RunCommand cmd = RUN_CONTINUE;
 
     Task* old_task = replay_session->current_task();
+    auto old_task_tuid = old_task ? old_task->tuid() : TaskUid();
     remote_code_ptr old_ip = old_task ? old_task->ip() : remote_code_ptr();
     FrameTime before_time = replay_session->trace_reader().time();
     if (replay_session->done_initial_exec() &&
@@ -563,14 +612,14 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
           return 0;
         }
 
-        if (!flags.singlestep_trace.empty()) {
-          done_first_step = true;
-          print_regs(old_task, before_time - 1, instruction_count_within_event,
-                     flags, stdout);
-        }
+        done_first_step = true;
+        print_regs(old_task, before_time - 1, instruction_count_within_event,
+                   flags, flags.singlestep_trace, stdout);
       }
 
-      cmd = RUN_SINGLESTEP_FAST_FORWARD;
+      if (need_to_singlestep) {
+        cmd = RUN_SINGLESTEP_FAST_FORWARD;
+      }
     }
 
     Event replayed_event = replay_session->current_trace_frame().event();
@@ -582,6 +631,9 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
 
     FrameTime after_time = replay_session->trace_reader().time();
     if (cmd != RUN_CONTINUE) {
+      // The old_task may have exited (and been deallocated) in the `replay_session->replay_step(cmd)` above.
+      // So we need to try and obtain it from the session again to make sure it still exists.
+      Task* old_task = old_task_tuid.tid() ? replay_session->find_task(old_task_tuid) : nullptr;
       remote_code_ptr after_ip = old_task ? old_task->ip() : remote_code_ptr();
       DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
 
@@ -601,13 +653,12 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
            before_time == after_time) &&
           (!result.incomplete_fast_forward || old_ip != after_ip ||
            before_time < after_time);
-      if (!flags.singlestep_trace.empty() &&
-          cmd == RUN_SINGLESTEP_FAST_FORWARD &&
+      if (cmd == RUN_SINGLESTEP_FAST_FORWARD &&
           (singlestep_really_complete ||
            (before_time < after_time &&
             treat_event_completion_as_singlestep_complete(replayed_event)))) {
         print_regs(old_task, before_time, instruction_count_within_event, flags,
-                   stdout);
+                   flags.singlestep_trace, stdout);
       }
 
       if (singlestep_really_complete) {
@@ -617,6 +668,8 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
     if (before_time < after_time) {
       LOG(debug) << "Completed event " << before_time
                  << " instruction_count=" << instruction_count_within_event;
+      print_regs(old_task, before_time, instruction_count_within_event, flags,
+                 flags.event_trace, stdout);
       instruction_count_within_event = 1;
     }
   }

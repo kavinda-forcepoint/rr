@@ -79,6 +79,22 @@ public:
   uint64_t read_xinuse(bool* defined) const;
 
   /**
+   * Read FIP field
+   */
+  uint64_t read_fip(bool* defined) const;
+
+  /**
+   * Read MXCSR field
+   */
+  uint32_t read_mxcsr(bool* defined) const;
+
+  /**
+   * Clear FIP and FDP registers if they're present.
+   * Returns true if the registers changed.
+   */
+  bool clear_fip_fdp();
+
+  /**
    * Like |Registers::read_register()|, except attempts to read
    * the value of an "extra register" (floating point / vector).
    */

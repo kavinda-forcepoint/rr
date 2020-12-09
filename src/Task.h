@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <vector>
+#include <unordered_map>
 
 #include "preload/preload_interface.h"
 
@@ -217,6 +218,11 @@ public:
   std::string proc_stat_path();
 
   /**
+   * Return the path of /proc/<pid>/exe
+   */
+  std::string proc_exe_path();
+
+  /**
    * Stat |fd| in the context of this task's fd table.
    */
   struct stat stat_fd(int fd);
@@ -233,6 +239,14 @@ public:
    * task's fd table.
    */
   std::string file_name_of_fd(int fd);
+  /**
+   * Get current offset of |fd|
+   */
+  int64_t fd_offset(int fd);
+  /**
+   * Get pid of pidfd |fd|
+   */
+  pid_t pid_of_pidfd(int fd);
 
   /**
    * Force the wait status of this to |status|, as if
@@ -444,8 +458,11 @@ public:
   /** Return the current regs of this. */
   const Registers& regs() const;
 
-  /** Return the extra registers of this. */
+  /** Return the extra registers of this. Asserts if the task died. */
   const ExtraRegisters& extra_regs();
+
+  /** Return the extra registers of this, or null if the task died. */
+  const ExtraRegisters* extra_regs_fallible();
 
   /** Return the current arch of this. This can change due to exec(). */
   SupportedArch arch() const {
@@ -536,6 +553,13 @@ public:
   void set_extra_regs(const ExtraRegisters& regs);
 
   /**
+   * Read the aarch64 TLS register via ptrace. Returns true on success, false
+   * on failure. On success `result` is set to the tracee's TLS register.
+   */
+  bool read_aarch64_tls_register(uintptr_t *result);
+  void set_aarch64_tls_register(uintptr_t val);
+
+  /**
    * Program the debug registers to the vector of watchpoint
    * configurations in |reg| (also updating the debug control
    * register appropriately).  Return true if all registers were
@@ -546,8 +570,11 @@ public:
    */
   bool set_debug_regs(const DebugRegs& regs);
 
+  bool set_aarch64_debug_regs(int which, ARM64Arch::user_hwdebug_state *regs, size_t nregs);
+  bool get_aarch64_debug_regs(int which, ARM64Arch::user_hwdebug_state *regs);
+
   uintptr_t get_debug_reg(size_t regno);
-  bool set_debug_reg(size_t regno, uintptr_t value);
+  bool set_x86_debug_reg(size_t regno, uintptr_t value);
 
   /** Update the thread area to |addr|. */
   void set_thread_area(remote_ptr<X86Arch::user_desc> tls);
@@ -840,7 +867,7 @@ public:
     Registers regs;
     ExtraRegisters extra_regs;
     std::string prname;
-    std::vector<X86Arch::user_desc> thread_areas;
+    uintptr_t fdtable_identity;
     remote_ptr<struct syscallbuf_hdr> syscallbuf_child;
     size_t syscallbuf_size;
     size_t num_syscallbuf_bytes;
@@ -857,6 +884,12 @@ public:
     int cloned_file_data_fd_child;
     std::string cloned_file_data_fname;
     WaitStatus wait_status;
+    // TLS state (architecture specific)
+    // On x86_64 the tls register is part of the general register state (%fs)
+    // On x86 thread_areas is used
+    // on aarch64, tls_register is used
+    uintptr_t tls_register;
+    std::vector<X86Arch::user_desc> thread_areas;
   };
 
   /**
@@ -886,6 +919,8 @@ public:
     return seen_ptrace_exit_event || detected_unexpected_exit;
   }
 
+  void did_handle_ptrace_exit_event();
+
   remote_code_ptr last_execution_resume() const {
     return address_of_last_execution_resume;
   }
@@ -894,11 +929,10 @@ public:
     return was_reaped;
   }
 
-  void did_reap() {
-    was_reaped = true;
+  void os_exec(SupportedArch arch, std::string filename);
+  void os_exec_stub(SupportedArch arch) {
+      os_exec(arch, find_exec_stub(arch));
   }
-
-  void os_exec_stub(SupportedArch arch);
 
   /**
    * Try to make the current task look exactly like some `other` task
@@ -916,6 +950,7 @@ public:
    */
   static Task* spawn(Session& session, ScopedFd& error_fd,
                      ScopedFd* sock_fd_out,
+                     ScopedFd* sock_fd_receiver_out,
                      int* tracee_socket_fd_number_out,
                      const std::string& exe_path,
                      const std::vector<std::string>& argv,
@@ -931,6 +966,10 @@ public:
    * syscallbuf desched signal (which is guaranteed not to be blocked).
    */
   void move_to_signal_stop();
+
+  // A map from original table to (potentially detached) clone, to preserve
+  // FdTable sharing relationships during a session fork.
+  using ClonedFdTables = std::unordered_map<uintptr_t, FdTable::shr_ptr>;
 
 protected:
   Task(Session& session, pid_t tid, pid_t rec_tid, uint32_t serial,
@@ -957,6 +996,7 @@ protected:
                       remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
                       pid_t new_tid, pid_t new_rec_tid, uint32_t new_serial,
                       Session* other_session = nullptr,
+                      FdTable::shr_ptr new_fds = nullptr,
                       ThreadGroup::shr_ptr new_tg = nullptr);
 
   /**
@@ -1051,9 +1091,10 @@ protected:
    * created.  |task_leader| will perform the actual OS calls to
    * create the new child.
    */
-  Task* os_fork_into(Session* session);
+  Task* os_fork_into(Session* session, FdTable::shr_ptr new_fds);
   static Task* os_clone_into(const CapturedState& state,
                              AutoRemoteSyscalls& remote,
+                             const ClonedFdTables& cloned_fd_tables,
                              ThreadGroup::shr_ptr new_tg);
 
   /**
@@ -1074,6 +1115,7 @@ protected:
   static Task* os_clone(CloneReason reason, Session* session,
                         AutoRemoteSyscalls& remote, pid_t rec_child_tid,
                         uint32_t new_serial, unsigned base_flags,
+                        FdTable::shr_ptr new_fds = nullptr,
                         ThreadGroup::shr_ptr new_tg = nullptr,
                         remote_ptr<void> stack = nullptr,
                         remote_ptr<int> ptid = nullptr,
@@ -1149,6 +1191,14 @@ protected:
   // True when a PTRACE_EXIT_EVENT has been observed in the wait_status
   // for this task.
   bool seen_ptrace_exit_event;
+  // True when a PTRACE_EXIT_EVENT has been handled for this task.
+  // By handled we mean either RecordSession's handle_ptrace_exit_event was
+  // run (or the replay equivalent) or we recognized that the task is already
+  // dead and we cleaned up our books so we don't try to destroy our buffers
+  // or anything like that in an already deceased task.
+  // We might defer handling the exit (e.g. if there's an ongoing execve).
+  // If this is true, `seen_ptrace_exit_event` must be true.
+  bool handled_ptrace_exit_event;
 
   PropertyTable properties_;
 

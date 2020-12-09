@@ -3,14 +3,18 @@
 #ifndef RR_KERNEL_SUPPLEMENT_H_
 #define RR_KERNEL_SUPPLEMENT_H_
 
+#define _GNU_SOURCE 1
+
 #include <linux/if_tun.h>
 #include <linux/mman.h>
 #include <linux/seccomp.h>
 #include <linux/usbdevice_fs.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/ptrace.h>
+#include <sys/wait.h>
 
 namespace rr {
 
@@ -81,6 +85,18 @@ namespace rr {
 #endif
 #ifndef PR_SET_SPECULATION_CTRL
 #define PR_SET_SPECULATION_CTRL 53
+#endif
+
+// This is used on AArch64 and available in linux/signal.h, but
+// including that header will conflict with a number of our
+// struct definitions.
+#ifndef TRAP_HWBKPT
+#define TRAP_HWBKPT 4
+#endif
+
+// This is used on AArch64 and not available on CentOS 7.8
+#ifndef NT_ARM_SYSTEM_CALL
+#define NT_ARM_SYSTEM_CALL 0x404
 #endif
 
 // These are defined by the include/linux/errno.h in the kernel tree.
@@ -188,6 +204,12 @@ struct rr_input_mask {
 #endif
 #ifndef MADV_DODUMP
 #define MADV_DODUMP 17
+#endif
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
+#endif
+#ifndef MADV_KEEPONFORK
+#define MADV_KEEPONFORK 19
 #endif
 #ifndef MADV_SOFT_OFFLINE
 #define MADV_SOFT_OFFLINE 101
@@ -344,6 +366,14 @@ enum {
 
 #ifndef MAX_HANDLE_SZ
 #define MAX_HANDLE_SZ 128
+#endif
+
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+
+#ifndef CLONE_PIDFD
+#define CLONE_PIDFD 0x1000
 #endif
 
 } // namespace rr

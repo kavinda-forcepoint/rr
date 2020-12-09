@@ -420,6 +420,38 @@ void ReplayTimeline::update_strategy_and_fix_watchpoint_quirk(
   }
 }
 
+void ReplayTimeline::seek_to_ticks(FrameTime time, Ticks ticks) {
+  seek_to_before_key(MarkKey(time, ticks, ReplayStepKey()));
+  unapply_breakpoints_and_watchpoints();
+
+  while (current->trace_reader().time() < time) {
+    ReplaySession::StepConstraints constraints(RUN_CONTINUE);
+    constraints.stop_at_time = time;
+    ReplayResult result = current->replay_step(constraints);
+    if (result.status != REPLAY_CONTINUE) {
+      FATAL() << "Trace finished before target was reached";
+    }
+  }
+
+  ReplayTask* t = current->current_task();
+  if (t->tick_count() < ticks) {
+    // First step using the ticks counter until we enter the skid region
+    ReplaySession::StepConstraints constraints(RUN_CONTINUE);
+    while (true) {
+      constraints.ticks_target = ticks;
+      ReplayResult result = current->replay_step(constraints);
+      if (result.break_status.approaching_ticks_target) {
+        break;
+      }
+    }
+
+    // Then singlestep until we hit our ticks target
+    while (t->tick_count() < ticks) {
+      current->replay_step(RUN_SINGLESTEP_FAST_FORWARD);
+    }
+  }
+}
+
 ReplayResult ReplayTimeline::replay_step_to_mark(
     const Mark& mark, ReplayStepToMarkStrategy& strategy) {
   ReplayTask* t = current->current_task();
@@ -900,6 +932,19 @@ static ReplayTask* to_replay_task(const BreakStatus& status) {
   return static_cast<ReplayTask*>(status.task);
 }
 
+static bool arch_watch_fires_before_instr(SupportedArch arch) {
+  switch (arch) {
+    case x86:
+    case x86_64:
+      return false;
+    case aarch64:
+      return true;
+    default:
+      FATAL() << "Unknown architecture";
+      return false;
+  }
+}
+
 ReplayResult ReplayTimeline::reverse_continue(
     const std::function<bool(ReplayTask* t)>& stop_filter,
     const std::function<bool()>& interrupt_check) {
@@ -946,17 +991,23 @@ ReplayResult ReplayTimeline::reverse_continue(
                << " up to " << end;
 
     bool at_breakpoint = false;
+    bool before_watchpoint = false;
     ReplayStepToMarkStrategy strategy;
     int stop_count = 0;
     bool made_progress_between_stops = false;
     remote_code_ptr avoidable_stop_ip;
     Ticks avoidable_stop_ticks = 0;
     while (true) {
-      apply_breakpoints_and_watchpoints();
       ReplayResult result;
       if (at_breakpoint) {
         result = singlestep_with_breakpoints_disabled();
+      } else if (before_watchpoint) {
+        // N.B.: This state is only reached on architectures where watchpoints
+        // fire *before* applying instruction effects (e.g. aarch64)
+        unapply_breakpoints_and_watchpoints();
+        result = current->replay_step(RUN_SINGLESTEP);
       } else {
+        apply_breakpoints_and_watchpoints();
         result = replay_step_to_mark(end, strategy);
         // This will remove all reverse-exec checkpoints ahead of the
         // current time, and add new ones if necessary. This should be
@@ -997,6 +1048,9 @@ ReplayResult ReplayTimeline::reverse_continue(
         } else {
           LOG(debug) << "Found watch break at " << dest << ", addr="
                      << result.break_status.data_watchpoints_hit()[0].addr;
+          if (arch_watch_fires_before_instr(current->arch())) {
+            before_watchpoint = true;
+          }
         }
         final_result = result;
         final_tuid = result.break_status.task ? result.break_status.task->tuid()
@@ -1112,7 +1166,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
   while (true) {
     Mark end = outer;
     Mark start;
-    bool seen_barrier;
+    bool seen_barrier = false;
 
     while (true) {
       MarkKey current_key = end.ptr->proto.key;
@@ -1241,6 +1295,14 @@ ReplayResult ReplayTimeline::reverse_singlestep(
             if (now > end) {
               // This last step is not usable.
               LOG(debug) << "   not usable, stopping now";
+              break;
+            } else if (now == end &&
+                       result.break_status.signal &&
+                       result.break_status.signal->si_signo == SIGTRAP &&
+                       is_advanced_pc_and_signaled_instruction(result.break_status.task,
+                                                               result.break_status.task->ip())) {
+              LOG(debug) << "   singlestepped exactly to instruction that advances pc and signals (e.g. int3),"
+                         << " pretending we stopped earlier.";
               break;
             }
             destination_candidate = step_start;

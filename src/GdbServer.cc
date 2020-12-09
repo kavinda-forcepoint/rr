@@ -63,6 +63,12 @@ static const string& gdb_rr_macros() {
        << "restart at checkpoint N\n"
        << "checkpoints are created with the 'checkpoint' command\n"
        << "end\n"
+       << "define seek-ticks\n"
+       << "  run t$arg0\n"
+       << "end\n"
+       << "document seek-ticks\n"
+       << "restart at given ticks value\n"
+       << "end\n"
        // In gdb version "Fedora 7.8.1-30.fc21", a raw "run" command
        // issued before any user-generated resume-execution command
        // results in gdb hanging just after the inferior hits an internal
@@ -464,7 +470,6 @@ void GdbServer::dispatch_debugger_request(Session& session,
             }
           }
           LOG(warn) << "No mapping found";
-          dbg->reply_pread(nullptr, 0, EIO);
         }
       }
       LOG(warn) << "Unknown file descriptor requested";
@@ -860,11 +865,24 @@ void GdbServer::maybe_notify_stop(const GdbRequest& req,
                                   const BreakStatus& break_status) {
   bool do_stop = false;
   remote_ptr<void> watch_addr;
+  char watch[1024];
+  watch[0] = '\0';
   if (!break_status.watchpoints_hit.empty()) {
     do_stop = true;
     memset(&stop_siginfo, 0, sizeof(stop_siginfo));
     stop_siginfo.si_signo = SIGTRAP;
     watch_addr = break_status.watchpoints_hit[0].addr;
+    bool any_hw_break = false;
+    for (const auto& w : break_status.watchpoints_hit) {
+      if (w.type == WATCH_EXEC) {
+        any_hw_break = true;
+      }
+    }
+    if (dbg->hwbreak_supported() && any_hw_break) {
+      snprintf(watch, sizeof(watch) - 1, "hwbreak:;");
+    } else if (watch_addr) {
+      snprintf(watch, sizeof(watch) - 1, "watch:%" PRIxPTR ";", watch_addr.as_int());
+    }
     LOG(debug) << "Stopping for watchpoint at " << watch_addr;
   }
   if (break_status.breakpoint_hit || break_status.singlestep_complete) {
@@ -872,6 +890,9 @@ void GdbServer::maybe_notify_stop(const GdbRequest& req,
     memset(&stop_siginfo, 0, sizeof(stop_siginfo));
     stop_siginfo.si_signo = SIGTRAP;
     if (break_status.breakpoint_hit) {
+      if (dbg->swbreak_supported()) {
+        snprintf(watch, sizeof(watch) - 1, "swbreak:;");
+      }
       LOG(debug) << "Stopping for breakpoint";
     } else {
       LOG(debug) << "Stopping for singlestep";
@@ -909,7 +930,7 @@ void GdbServer::maybe_notify_stop(const GdbRequest& req,
     /* Notify the debugger and process any new requests
      * that might have triggered before resuming. */
     dbg->notify_stop(get_threadid(t), stop_siginfo.si_signo,
-                     watch_addr.as_int());
+                     watch);
     last_query_tuid = last_continue_tuid = t->tuid();
   }
 }
@@ -1404,6 +1425,55 @@ void GdbServer::restart_session(const GdbRequest& req) {
     checkpoint_to_restore = it->second;
   } else if (req.restart().type == RESTART_FROM_PREVIOUS) {
     checkpoint_to_restore = debugger_restart_checkpoint;
+  } else if (req.restart().type == RESTART_FROM_TICKS) {
+    Ticks target = req.restart().param;
+    ReplaySession &session = timeline.current_session();
+    Task* task = session.current_task();
+    FrameTime current_time = session.current_frame_time();
+    TraceReader tmp_reader(session.trace_reader());
+    FrameTime last_time = current_time;
+    if (session.ticks_at_start_of_current_event() > target) {
+      tmp_reader.rewind();
+      FrameTime task_time;
+      // EXEC and CLONE reset the ticks counter. Find the first event
+      // where the tuid matches our current task.
+      // We'll always hit at least one CLONE/EXEC event for a task
+      // (we can't debug the time before the initial exec)
+      // but set this to 0 anyway to silence compiler warnings.
+      FrameTime ticks_start_time = 0;
+      while (true) {
+        TraceTaskEvent r = tmp_reader.read_task_event(&task_time);
+        if (task_time >= current_time) {
+          break;
+        }
+        if (r.type() == TraceTaskEvent::CLONE || r.type() == TraceTaskEvent::EXEC) {
+          if (r.tid() == task->tuid().tid()) {
+            ticks_start_time = task_time;
+          }
+        }
+      }
+      // Forward the frame reader to the current event
+      last_time = ticks_start_time;
+      while (true) {
+        TraceFrame frame = tmp_reader.read_frame();
+        if (frame.time() >= ticks_start_time) {
+          break;
+        }
+      }
+    }
+    while (true) {
+      if (tmp_reader.at_end()) {
+        cout << "No event found matching specified ticks target.";
+        dbg->notify_restart_failed();
+        return;
+      }
+      TraceFrame frame = tmp_reader.read_frame();
+      if (frame.tid() == task->tuid().tid() && frame.ticks() > target) {
+        break;
+      }
+      last_time = frame.time();
+    }
+    timeline.seek_to_ticks(last_time, target);
   }
 
   interrupt_pending = true;
@@ -1424,25 +1494,26 @@ void GdbServer::restart_session(const GdbRequest& req) {
 
   stop_replaying_to_target = false;
 
-  DEBUG_ASSERT(req.restart().type == RESTART_FROM_EVENT);
-  // Note that we don't reset the target pid; we intentionally keep targeting
-  // the same process no matter what is running when we hit the event.
-  target.event = req.restart().param;
-  target.event = min(final_event - 1, target.event);
-  timeline.seek_to_before_event(target.event);
-  do {
-    ReplayResult result =
-        timeline.replay_step_forward(RUN_CONTINUE, target.event);
-    // We should never reach the end of the trace without hitting the stop
-    // condition below.
-    DEBUG_ASSERT(result.status != REPLAY_EXITED);
-    if (is_last_thread_exit(result.break_status) &&
-        result.break_status.task->thread_group()->tgid == target.pid) {
-      // Debuggee task is about to exit. Stop here.
-      in_debuggee_end_state = true;
-      break;
-    }
-  } while (!at_target());
+  if (req.restart().type == RESTART_FROM_EVENT) {
+    // Note that we don't reset the target pid; we intentionally keep targeting
+    // the same process no matter what is running when we hit the event.
+    target.event = req.restart().param;
+    target.event = min(final_event - 1, target.event);
+    timeline.seek_to_before_event(target.event);
+    do {
+      ReplayResult result =
+          timeline.replay_step_forward(RUN_CONTINUE, target.event);
+      // We should never reach the end of the trace without hitting the stop
+      // condition below.
+      DEBUG_ASSERT(result.status != REPLAY_EXITED);
+      if (is_last_thread_exit(result.break_status) &&
+          result.break_status.task->thread_group()->tgid == target.pid) {
+        // Debuggee task is about to exit. Stop here.
+        in_debuggee_end_state = true;
+        break;
+      }
+    } while (!at_target());
+  }
   activate_debugger();
 }
 
@@ -1815,32 +1886,22 @@ static bool is_likely_interp(string fsname) {
 
 static remote_ptr<void> base_addr_from_rendezvous(Task* t, string fname)
 {
-  std::vector<uint8_t> auxv = t->vm()->saved_auxv();
-  if (auxv.size() == 0 || (auxv.size() % sizeof(uint64_t) != 0)) {
-    // Corrupted or missing auxv
+  remote_ptr<void> interpreter_base = t->vm()->saved_interpreter_base();
+  if (!interpreter_base || !t->vm()->has_mapping(interpreter_base)) {
     return nullptr;
   }
-  remote_ptr<void> interpreter_base = nullptr;
-  bool found = false;
-  for (size_t i = 0; i < (auxv.size() / sizeof(uint64_t)) - 1; i += 2) {
-    uint64_t* entry = ((uint64_t*)auxv.data())+i;
-    uint64_t kind = entry[0];
-    uint64_t value = entry[1];
-    if (kind == AT_BASE) {
-      interpreter_base = value;
-      found = true;
-      break;
-    }
+  string ld_path = t->vm()->saved_ld_path();
+  if (ld_path.length() == 0) {
+    FATAL() << "Failed to retrieve interpreter name with interpreter_base=" << interpreter_base;
   }
-  if (!found || !t->vm()->has_mapping(interpreter_base)) {
-    return nullptr;
-  }
-  string ld_path = t->vm()->mapping_of(interpreter_base).map.fsname();
   ScopedFd ld(ld_path.c_str(), O_RDONLY);
+  if (ld < 0) {
+    FATAL() << "Open failed: " << ld_path;
+  }
   ElfFileReader reader(ld);
   auto syms = reader.read_symbols(".dynsym", ".dynstr");
   static const char r_debug[] = "_r_debug";
-  found = false;
+  bool found = false;
   uintptr_t r_debug_offset = 0;
   for (size_t i = 0; i < syms.size(); ++i) {
     if (!syms.is_name(i, r_debug)) {

@@ -115,6 +115,32 @@ static void record_exit_trace_event(RecordTask* t, WaitStatus exit_status) {
   }
 }
 
+static bool looks_like_syscall_entry(RecordTask* t) {
+  bool ok;
+  bool at_syscall = is_at_syscall_instruction(t,
+      t->regs().ip().decrement_by_syscall_insn_length(t->arch()), &ok);
+  // It's possible for the task to have died (e.g. if it got signaled twice
+  // in rapid succession). In that case, try to just go by register contents.
+  if (ok && !at_syscall) {
+    return false;
+  }
+  if (is_x86ish(t->arch())) {
+    // On x86 rax gets set to ENOSYS on entry. Elsewhere this does not happen.
+    // Further, even if we did ask about the syscallno, it might have been
+    // reset by the signal handler. However, on non-x86 platforms we currently
+    // count taken braches, rather than only conditional ones, so it should
+    // be impossible to see the same syscall ip twice without intervening
+    // ticks, so the check that follows these conditions, should be sufficient
+    // there.
+    return t->regs().original_syscallno() >= 0 &&
+           t->regs().syscall_result_signed() == -ENOSYS;
+  }
+  // Getting a sched event here is better than a spurious syscall event.
+  // Syscall entry does not cause visible register modification, so upon
+  // hitting the sched event the register state would indeed match.
+  return ok;
+}
+
 /**
  * Return true if we handle a ptrace exit event for task t. When this returns
  * true, t has been deleted and cannot be referenced again.
@@ -142,16 +168,16 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
       // need to replay.
       // There's a weird case (in 4.13.5-200.fc26.x86_64 at least) where the
       // task can enter the kernel but instead of receiving a syscall ptrace
-      // event, we receive a PTRACE_EXIT_EVENT due to a concurrent execve
+      // event, we receive a PTRACE_EVENT_EXIT due to a concurrent execve
       // (and probably a concurrent SIGKILL could do the same). The task state
       // has been updated to reflect syscall entry. If we record a SCHED in
       // that state replay of the SCHED will fail. So detect that state and fix
       // it up.
-      if (t->regs().original_syscallno() >= 0 &&
-          t->regs().syscall_result_signed() == -ENOSYS) {
+      if (looks_like_syscall_entry(t)) {
         // Either we're in a syscall, or we're immediately after a syscall
-        // and it exited with ENOSYS.
-        if (t->ticks_at_last_recorded_syscall_exit == t->tick_count()) {
+        // and it exited.
+        if (t->ticks_at_last_recorded_syscall_exit == t->tick_count() &&
+            t->regs().ip() == t->ip_at_last_recorded_syscall_exit) {
           LOG(debug) << "Nothing to record after PTRACE_EVENT_EXIT";
           // It's the latter case; do nothing.
         } else {
@@ -193,11 +219,18 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
     exit_status = WaitStatus::for_fatal_sig(SIGKILL);
   }
 
+  t->did_handle_ptrace_exit_event();
+
   // If we died because of a coredumping signal, that is a barrier event, and
   // every task in the address space needs to pass its PTRACE_EXIT_EVENT before
   // they proceed to (potentially hidden) zombie state, so we can't wait for
-  // that to happen
-  bool may_wait_exit = !is_coredumping_signal(exit_status.fatal_sig());
+  // that to happen/
+  // Similarly we can't wait for this task to exit if there are other
+  // tasks in its pid namespace that need to exit and this is the last thread
+  // of pid-1 in that namespace, because the kernel must reap them before
+  // letting this task complete its exit.
+  bool may_wait_exit = !is_coredumping_signal(exit_status.fatal_sig()) &&
+    !t->waiting_for_pid_namespace_tasks_to_exit();
   if (!t->already_reaped()) {
     t->proceed_to_exit(may_wait_exit);
   }
@@ -246,6 +279,7 @@ static void note_entering_syscall(RecordTask* t) {
   }
 }
 
+#if defined (__x86_64__)
 static bool is_in_vsyscall(remote_code_ptr ip)
 {
   // This is hardcoded by the Linux ABI
@@ -253,6 +287,12 @@ static bool is_in_vsyscall(remote_code_ptr ip)
   remote_code_ptr vsyscall_end = 0xffffffffff601000;
   return vsyscall_start <= ip && ip < vsyscall_end;
 }
+#else
+static bool is_in_vsyscall(remote_code_ptr)
+{
+  return false;
+}
+#endif
 
 void RecordSession::handle_seccomp_traced_syscall(RecordTask* t,
                                                   StepState* step_state,
@@ -473,9 +513,11 @@ static void handle_seccomp_trap(RecordTask* t,
     case x86_64:
       si.native_api._sifields._sigsys._arch = AUDIT_ARCH_X86_64;
       break;
+    #ifdef AUDIT_ARCH_AARCH64
     case aarch64:
       si.native_api._sifields._sigsys._arch = AUDIT_ARCH_AARCH64;
       break;
+    #endif
     default:
       DEBUG_ASSERT(0 && "Unknown architecture");
       break;
@@ -604,15 +646,14 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
           case SECCOMP_RET_KILL:
             LOG(debug) << "  seccomp kill for syscall: "
                        << syscall_name(syscallno, t->arch());
-            for (Task* tt : t->thread_group()->task_set()) {
-              // Record robust futex changes now in case the taskgroup dies
-              // synchronously without a regular PTRACE_EVENT_EXIT (as seems
-              // to happen on Ubuntu 4.2.0-42-generic)
-              RecordTask* rt = static_cast<RecordTask*>(tt);
-              record_robust_futex_changes(rt);
-            }
             t->tgkill(SIGKILL);
-            step_state->continue_type = RecordSession::CONTINUE;
+            // Rely on the SIGKILL to bump us out of the ptrace stop.
+            step_state->continue_type = RecordSession::DONT_CONTINUE;
+            // Now wait for us to actually exit our ptrace-stop and proceed
+            // to the PTRACE_EVENT_EXIT. This avoids the race where our
+            // PTRACE_CONT might kick us out of the PTRACE_EVENT_EXIT before
+            // we can process it.
+            t->wait();
             break;
           default:
             ASSERT(t, false) << "Seccomp result not handled";
@@ -999,7 +1040,6 @@ void RecordSession::syscall_state_changed(RecordTask* t,
         return;
       }
       last_task_switchable = PREVENT_SWITCH;
-      t->apply_syscall_entry_regs();
       t->ev().Syscall().regs = t->regs();
       t->ev().Syscall().state = ENTERING_SYSCALL;
       // The syscallno may have been changed by the ptracer
@@ -1383,13 +1423,16 @@ static bool inject_handled_signal(RecordTask* t) {
   } while (t->stop_sig() == t->session().syscallbuf_desched_sig());
 
   if (t->stop_sig() == SIGSEGV) {
-    // Constructing the signal handler frame must have failed. The kernel will
-    // kill the process after this. Stash the signal and make sure
-    // we know to treat it as fatal when we inject it. Also disable the
-    // signal handler to match what the kernel does.
-    t->did_set_sig_handler_default(SIGSEGV);
+    // Constructing the signal handler frame must have failed. Stash the signal
+    // to deliver it later.
     t->stash_sig();
-    t->thread_group()->received_sigframe_SIGSEGV = true;
+    if (sig == SIGSEGV) {
+      // The kernel will kill the process after this. Make sure we know to treat
+      // it as fatal when we inject it. Also disable the signal handler to match
+      // what the kernel does.
+      t->did_set_sig_handler_default(SIGSEGV);
+      t->thread_group()->received_sigframe_SIGSEGV = true;
+    }
     return false;
   }
 
@@ -1786,10 +1829,13 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
       return true;
     }
 
-    if (t->vm()->monkeypatcher().try_patch_syscall(t)) {
-      // Syscall was patched. Emit event and continue execution.
-      t->record_event(Event::patch_syscall());
-      return true;
+    // Don't ever patch a sigreturn syscall. These can't go through the syscallbuf.
+    if (!is_sigreturn(t->regs().original_syscallno(), t->arch())) {
+      if (t->vm()->monkeypatcher().try_patch_syscall(t)) {
+        // Syscall was patched. Emit event and continue execution.
+        t->record_event(Event::patch_syscall());
+        return true;
+      }
     }
 
     if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
@@ -1925,22 +1971,6 @@ bool RecordSession::prepare_to_inject_signal(RecordTask* t,
   return true;
 }
 
-static string find_helper_library(const char* basepath) {
-  string lib_path = resource_path() + "lib64/rr/";
-  string file_name = lib_path + basepath;
-  if (access(file_name.c_str(), F_OK) == 0) {
-    return lib_path;
-  }
-  lib_path = resource_path() + "lib/rr/";
-  file_name = lib_path + basepath;
-  if (access(file_name.c_str(), F_OK) == 0) {
-    return lib_path;
-  }
-  // File does not exist. Assume install put it in LD_LIBRARY_PATH.
-  lib_path = "";
-  return lib_path;
-}
-
 static void inject_ld_helper_library(vector<string>& env,
                                      string env_var,
                                      string value) {
@@ -2069,7 +2099,8 @@ static string lookup_by_path(const string& name) {
     const string& output_trace_dir,
     const TraceUuid* trace_id,
     bool use_audit,
-    bool unmap_vdso) {
+    bool unmap_vdso,
+    bool force_asan_active) {
   // The syscallbuf library interposes some critical
   // external symbols like XShmQueryExtension(), so we
   // preload it whether or not syscallbuf is enabled. Indicate here whether
@@ -2090,7 +2121,8 @@ static string lookup_by_path(const string& name) {
           fprintf(stderr,
                   "rr needs /proc/sys/kernel/perf_event_paranoid <= 1, but it is %d.\n"
                   "Change it to 1, or use 'rr record -n' (slow).\n"
-                  "Consider putting 'kernel.perf_event_paranoid = 1' in /etc/sysctl.conf\n",
+                  "Consider putting 'kernel.perf_event_paranoid = 1' in /etc/sysctl.conf.\n"
+                  "See 'man 8 sysctl', 'man 5 sysctl.d' and 'man 5 sysctl.conf' for more details.\n",
                   val);
           exit(1);
         }
@@ -2145,6 +2177,8 @@ static string lookup_by_path(const string& name) {
   env.push_back("RUNNING_UNDER_RR=1");
   // Stop Mesa using the GPU
   env.push_back("LIBGL_ALWAYS_SOFTWARE=1");
+  env.push_back("GBM_ALWAYS_SOFTWARE=1");
+  env.push_back("SDL_RENDER_DRIVER=software");
   // Stop sssd from using shared-memory with its daemon
   env.push_back("SSS_NSS_USE_MEMCACHE=NO");
 
@@ -2161,13 +2195,16 @@ static string lookup_by_path(const string& name) {
     env.push_back("OPENSSL_ia32cap=~4611686018427387904:~0");
     // Disable Qt's use of RDRAND/RDSEED/RTM
     env.push_back("QT_NO_CPU_FEATURE=rdrand rdseed rtm");
+    // Disable systemd's use of RDRAND
+    env.push_back("SYSTEMD_RDRAND=0");
   }
 
   shr_ptr session(
       new RecordSession(full_path, argv, env, disable_cpuid_features,
                         syscallbuf, syscallbuf_desched_sig, bind_cpu,
                         output_trace_dir, trace_id, use_audit, unmap_vdso));
-  session->set_asan_active(!exe_info.libasan_path.empty() ||
+  session->set_asan_active(force_asan_active ||
+                           !exe_info.libasan_path.empty() ||
                            exe_info.has_asan_symbols);
   return session;
 }
@@ -2214,12 +2251,22 @@ RecordSession::RecordSession(const std::string& exe_path,
   ScopedFd error_fd = create_spawn_task_error_pipe();
   RecordTask* t = static_cast<RecordTask*>(
       Task::spawn(*this, error_fd, &tracee_socket_fd(),
+                  &tracee_socket_receiver_fd(),
                   &tracee_socket_fd_number,
                   exe_path, argv, envp));
 
   if (NativeArch::is_x86ish()) {
     // CPU affinity has been set.
     trace_out.setup_cpuid_records(has_cpuid_faulting(), disable_cpuid_features_);
+    if (cpu_has_xsave_fip_fdp_quirk()) {
+      trace_out.set_xsave_fip_fdp_quirk(true);
+      // Clear FIP/FDP on every event to reduce the probability of this quirk
+      // causing divergence, especially when porting traces to Intel machines
+      trace_out.set_clear_fip_fdp(true);
+    }
+    if (cpu_has_fdp_exception_only_quirk()) {
+      trace_out.set_fdp_exception_only_quirk(true);
+    }
   }
 
   initial_thread_group = t->thread_group();

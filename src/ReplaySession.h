@@ -286,6 +286,8 @@ public:
 
   virtual ReplaySession* as_replay() override { return this; }
 
+  SupportedArch arch() { return trace_in.arch(); }
+
   /**
    * Return true if |sig| is a signal that may be generated during
    * replay but should be ignored.  For example, SIGCHLD can be
@@ -311,6 +313,8 @@ public:
   virtual TraceStream* trace_stream() override { return &trace_in; }
 
   virtual int cpu_binding(TraceStream& trace) const override;
+
+  bool explicit_proc_mem() { return trace_in.explicit_proc_mem(); }
 
 private:
   ReplaySession(const std::string& dir, const Flags& flags);

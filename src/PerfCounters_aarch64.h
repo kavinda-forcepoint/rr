@@ -17,6 +17,7 @@ static CpuMicroarch compute_cpu_microarch() {
   if (1 != fscanf(midr_el1, "%x", &midir)) {
     CLEAN_FATAL() << "Failed to read midr register from kernel";
   }
+  fclose(midr_el1);
   switch (midir) {
     case 0x413fd0c1:
       return ARMNeoverseN1;
@@ -42,7 +43,7 @@ static bool always_recreate_counters() {
   return false;
 }
 
-static void check_for_arch_bugs() {}
+static void check_for_arch_bugs(__attribute__((unused)) CpuMicroarch uarch) {}
 
 template <>
 void PerfCounters::reset_arch_extras<ARM64Arch>() {

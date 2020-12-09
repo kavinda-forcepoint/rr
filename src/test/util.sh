@@ -108,9 +108,6 @@ else
     TESTNAME_NO_BITNESS=$TESTNAME
 fi
 LIB_ARG=$2
-if [[ "$LIB_ARG" == "" ]]; then
-    LIB_ARG=-b
-fi
 OBJDIR=$3
 if [[ "$OBJDIR" == "" ]]; then
     # Default to assuming that the user's working directory is the
@@ -213,10 +210,17 @@ function skip_if_no_syscall_buf {
     fi
 }
 
+function skip_if_32_bit {
+    if [[ "_32" == $bitness ]] || [[ "$(uname -m)" =~ i[3-6]86 ]]; then
+        echo NOTE: Skipping 32-bit "'$TESTNAME'"
+        exit 0
+    fi
+}
+
 # If the test is causing an unrealistic failure when the syscallbuf is
 # enabled, skip it.  This better be a temporary situation!
 function skip_if_syscall_buf {
-    if [[ "-b" == "$LIB_ARG" || "" == "$LIB_ARG" ]]; then
+    if [[ "" == "$LIB_ARG" ]]; then
         echo NOTE: Skipping "'$TESTNAME'" because syscallbuf is enabled
         exit 0
     fi
@@ -258,6 +262,11 @@ function record_async_signal { sig=$1; delay_secs=$2; exe=$3; exeargs=$4;
 function replay { replayflags=$1
     _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT replay.err \
         $RR_EXE $GLOBAL_OPTIONS replay -a $replayflags 1> replay.out 2> replay.err
+}
+
+function rerun { rerunflags=$1
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT rerun.err \
+        $RR_EXE $GLOBAL_OPTIONS rerun $rerunflags 1> rerun.out 2> rerun.err
 }
 
 function do_ps { psflags=$1
@@ -406,6 +415,15 @@ function compare_test { token=$1; replayflags=$2;
 function debug_test {
     record $TESTNAME
     debug $TEST_PREFIX$TESTNAME_NO_BITNESS
+}
+
+#  rerun_singlestep_test
+#
+# Record the test name passed to |util.sh|, then rerun --singlestep
+# the recording.
+function rerun_singlestep_test {
+    record $TESTNAME
+    rerun "--singlestep=rip,gp_x16,flags"
 }
 
 # Return the number of events in the most recent local recording.

@@ -172,7 +172,10 @@ RegisterInfo<rr::ARM64Arch>::Table RegisterInfo<rr::ARM64Arch>::registers = {
   RV_AARCH64(X26, x[26]), RV_AARCH64(X27, x[27]), RV_AARCH64(X28, x[28]),
   RV_AARCH64(X29, x[29]), RV_AARCH64(X30, x[30]),
   RV_AARCH64(SP, sp), RV_AARCH64(PC, pc),
-  RV_AARCH64_WITH_MASK(CPSR, pstate, 0xffffffffLL, 4),
+  // Mask out the single-step flag from the pstate. During replay, we may
+  // single-step to an execution point, which could set the single-step bit
+  // when it wasn't set during record.
+  RV_AARCH64_WITH_MASK(CPSR, pstate, 0xffffffffLL & ~AARCH64_DBG_SPSR_SS, 4),
 };
 
 #undef RV_X64
@@ -574,6 +577,17 @@ NativeArch::user_regs_struct Registers::get_ptrace() const {
   return result.linux_api;
 }
 
+iovec Registers::get_ptrace_iovec() {
+  if (arch() == NativeArch::arch()) {
+    iovec iov = { &u, sizeof(NativeArch::user_regs_struct) };
+    return iov;
+  }
+
+  DEBUG_ASSERT(arch() == x86 && NativeArch::arch() == x86_64);
+  iovec iov = { &u.x86regs, sizeof(u.x86regs) };
+  return iov;
+}
+
 Registers::InternalData Registers::get_ptrace_for_self_arch() const {
   switch (arch_) {
     case x86:
@@ -645,54 +659,45 @@ void Registers::set_from_trace(SupportedArch a, const void* data,
   memcpy(&u.arm64regs, data, sizeof(u.arm64regs));
 }
 
-uintptr_t Registers::flags() const {
+bool Registers::aarch64_singlestep_flag() {
   switch (arch()) {
-    case x86:
-      return u.x86regs.eflags;
-    case x86_64:
-      return u.x64regs.eflags;
+    case aarch64:
+      return pstate() & AARCH64_DBG_SPSR_SS;
     default:
-      DEBUG_ASSERT(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "X86 only code path");
       return false;
   }
 }
 
-void Registers::set_flags(uintptr_t value) {
+void Registers::set_aarch64_singlestep_flag() {
   switch (arch()) {
-    case x86:
-      u.x86regs.eflags = value;
-      break;
-    case x86_64:
-      u.x64regs.eflags = value;
-      break;
+    case aarch64:
+      return set_pstate(pstate() | AARCH64_DBG_SPSR_SS);
     default:
-      DEBUG_ASSERT(0 && "Unknown arch");
-      break;
+      DEBUG_ASSERT(0 && "AArch64 only code path");
+      return;
   }
 }
 
-bool Registers::singlestep_flag() {
+bool Registers::x86_singlestep_flag() {
   switch (arch()) {
     case x86:
     case x86_64:
       return flags() & X86_TF_FLAG;
-    case aarch64:
-      return pstate() & AARCH64_DBG_SPSR_SS;
     default:
-      DEBUG_ASSERT(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "X86 only code path");
       return false;
   }
 }
 
-void Registers::clear_singlestep_flag() {
+void Registers::clear_x86_singlestep_flag() {
   switch (arch()) {
     case x86:
     case x86_64:
-      return set_flags(flags() & ~X86_TF_FLAG);
-    case aarch64:
-      return set_pstate(pstate() & ~AARCH64_DBG_SPSR_SS);
+      set_flags(flags() & ~X86_TF_FLAG);
+      return;
     default:
-      DEBUG_ASSERT(0 && "Unknown arch");
+      DEBUG_ASSERT(0 && "X86 only code path");
       break;
   }
 }

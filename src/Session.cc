@@ -38,10 +38,12 @@ struct Session::CloneCompletion {
     vector<pair<remote_ptr<void>, vector<uint8_t>>> captured_memory;
   };
   vector<AddressSpaceClone> address_spaces;
+  Task::ClonedFdTables cloned_fd_tables;
 };
 
 Session::Session()
-    : tracee_socket(shared_ptr<ScopedFd>(new ScopedFd())),
+    : tracee_socket(make_shared<ScopedFd>()),
+      tracee_socket_receiver(make_shared<ScopedFd>()),
       tracee_socket_fd_number(0),
       next_task_serial_(1),
       rrcall_base_(RR_CALL_BASE),
@@ -56,7 +58,7 @@ Session::~Session() {
   kill_all_tasks();
   LOG(debug) << "Session " << this << " destroyed";
 
-  for (auto tg : thread_group_map) {
+  for (auto tg : thread_group_map_) {
     tg.second->forget_session();
   }
 }
@@ -68,13 +70,14 @@ Session::Session(const Session& other) {
   rrcall_base_ = other.rrcall_base_;
   visible_execution_ = other.visible_execution_;
   tracee_socket = other.tracee_socket;
+  tracee_socket_receiver = other.tracee_socket_receiver;
   tracee_socket_fd_number = other.tracee_socket_fd_number;
   ticks_semantics_ = other.ticks_semantics_;
 }
 
-void Session::on_create(ThreadGroup* tg) { thread_group_map[tg->tguid()] = tg; }
+void Session::on_create(ThreadGroup* tg) { thread_group_map_[tg->tguid()] = tg; }
 void Session::on_destroy(ThreadGroup* tg) {
-  thread_group_map.erase(tg->tguid());
+  thread_group_map_.erase(tg->tguid());
 }
 
 void Session::post_exec() {
@@ -179,8 +182,8 @@ Task* Session::find_task(const TaskUid& tuid) const {
 
 ThreadGroup* Session::find_thread_group(const ThreadGroupUid& tguid) const {
   finish_initializing();
-  auto it = thread_group_map.find(tguid);
-  if (thread_group_map.end() == it) {
+  auto it = thread_group_map_.find(tguid);
+  if (thread_group_map_.end() == it) {
     return nullptr;
   }
   return it->second;
@@ -188,7 +191,7 @@ ThreadGroup* Session::find_thread_group(const ThreadGroupUid& tguid) const {
 
 ThreadGroup* Session::find_thread_group(pid_t pid) const {
   finish_initializing();
-  for (auto& tg : thread_group_map) {
+  for (auto& tg : thread_group_map_) {
     if (tg.first.tid() == pid) {
       return tg.second;
     }
@@ -317,12 +320,12 @@ BreakStatus Session::diagnose_debugger_trap(Task* t, RunCommand run_command) {
       BreakpointType retired_bp =
           t->vm()->get_breakpoint_type_for_retired_insn(t->ip());
       if (BKPT_USER == retired_bp) {
-        LOG(debug) << "hit debugger breakpoint at ip " << t->ip();
         // SW breakpoint: $ip is just past the
         // breakpoint instruction.  Move $ip back
         // right before it.
         t->move_ip_before_breakpoint();
         break_status.breakpoint_hit = true;
+        LOG(debug) << "hit debugger breakpoint at ip " << t->ip();
       }
     }
   }
@@ -359,15 +362,15 @@ void Session::finish_initializing() const {
                                                   mem.second.data());
       }
       for (auto& asmember : asleader.member_states) {
-        auto it = thread_group_map.find(asmember.tguid);
-        ThreadGroup::shr_ptr tg(it == thread_group_map.end() ? nullptr :
+        auto it = thread_group_map_.find(asmember.tguid);
+        ThreadGroup::shr_ptr tg(it == thread_group_map_.end() ? nullptr :
           it->second->shared_from_this());
         if (!tg) {
           tg = std::make_shared<ThreadGroup>
             (self, nullptr, asmember.tguid.tid(), asmember.tguid.tid(), asmember.tguid.serial());
-          self->on_create(tg.get());
         }
-        Task* t_clone = Task::os_clone_into(asmember, remote, tg);
+        Task* t_clone = Task::os_clone_into(
+            asmember, remote, clone_completion->cloned_fd_tables, tg);
         self->on_create(t_clone);
         t_clone->copy_state(asmember);
       }
@@ -605,11 +608,23 @@ static vector<uint8_t> capture_syscallbuf(const AddressSpace::Mapping& m,
   return clone_leader->read_mem(start, data_size);
 }
 
+static FdTable::shr_ptr& get_or_clone_fd_table(
+    Task::ClonedFdTables& existing_clones, Task* task_to_clone) {
+  auto original_fd_table = task_to_clone->fd_table();
+  FdTable::shr_ptr& existing_clone =
+      existing_clones[uintptr_t(original_fd_table.get())];
+  if (!existing_clone) {
+    existing_clone = original_fd_table->clone();
+  }
+  return existing_clone;
+}
+
 void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
   assert_fully_initialized();
   DEBUG_ASSERT(!dest.clone_completion);
 
   auto completion = unique_ptr<CloneCompletion>(new CloneCompletion());
+  auto& cloned_fd_tables = completion->cloned_fd_tables;
 
   for (auto vm : vm_map) {
     // Pick an arbitrary task to be group leader. The actual group leader
@@ -621,7 +636,8 @@ void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
     completion->address_spaces.push_back(CloneCompletion::AddressSpaceClone());
     auto& group = completion->address_spaces.back();
 
-    group.clone_leader = group_leader->os_fork_into(&dest);
+    group.clone_leader = group_leader->os_fork_into(
+        &dest, get_or_clone_fd_table(cloned_fd_tables, group_leader));
     dest.on_create(group.clone_leader);
     LOG(debug) << "  forked new group leader " << group.clone_leader->tid;
 
@@ -655,6 +671,7 @@ void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
         }
         LOG(debug) << "    cloning " << t->rec_tid;
 
+        get_or_clone_fd_table(cloned_fd_tables, t);
         group.member_states.push_back(t->capture_state());
       }
     }
