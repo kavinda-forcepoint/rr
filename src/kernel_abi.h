@@ -1667,6 +1667,24 @@ struct BaseArch : public wordsize,
     ptr<link_map> r_map;
     // More fields we don't need (and are potentially libc specific)
   };
+
+  struct prctl_mm_map {
+    __u64 start_code;
+    __u64 end_code;
+    __u64 start_data;
+    __u64 end_data;
+    __u64 start_brk;
+    __u64 brk;
+    __u64 start_stack;
+    __u64 arg_start;
+    __u64 arg_end;
+    __u64 env_start;
+    __u64 env_end;
+    ptr<__u64> auxv;
+    __u32 auxv_size;
+    __u32 exe_fd;
+  };
+  RR_VERIFY_TYPE(prctl_mm_map);
 };
 
 struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
@@ -1884,6 +1902,7 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   // PTRACE_ARCH_PRCTL does not exist on x86
   static const int PTRACE_SYSEMU = Arch64::PTRACE_SYSEMU;
   static const int PTRACE_SYSEMU_SINGLESTEP = Arch64::PTRACE_SYSEMU_SINGLESTEP;
+  static const int RR_AT_SYSINFO = 32;
 
   struct user_regs_struct {
     int32_t ebx;

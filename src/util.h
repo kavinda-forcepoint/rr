@@ -66,7 +66,7 @@ std::string read_ld_path(Task* t, remote_ptr<void> interpreter_base);
  */
 std::vector<std::string> read_env(Task* t);
 
-void patch_auxv_vdso(RecordTask* t);
+void patch_auxv_vdso(RecordTask* t, uintptr_t search, uintptr_t new_entry);
 
 /**
  * Create a file named |filename| and dump |buf_len| words in |buf| to
@@ -193,6 +193,7 @@ enum cpuid_requests {
   CPUID_INTELBRANDSTRINGEND,
 };
 
+const int XSAVE_FEATURE_FLAG = 1 << 26;
 const int OSXSAVE_FEATURE_FLAG = 1 << 27;
 const int AVX_FEATURE_FLAG = 1 << 28;
 const int HLE_FEATURE_FLAG = 1 << 4;
@@ -528,6 +529,10 @@ static inline struct timeval to_timeval(double t) {
 
 /* Slow but simple pop-count implementation. */
 int pop_count(uint64_t v);
+
+/* A version of fatal that uses no allocation/thread resource and is thus
+  safe to use in volatile contexts */
+void SAFE_FATAL(int err, const char *msg);
 
 } // namespace rr
 

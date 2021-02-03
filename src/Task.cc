@@ -14,7 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/personality.h>
-#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -2065,6 +2064,12 @@ void Task::did_waitpid(WaitStatus status) {
         // cs segment register and checking if that segment is a long mode segment
         // (Linux always uses GDT entries for this, which are globally the same).
         SupportedArch a = is_long_mode_segment(registers.cs()) ? x86_64 : x86;
+
+        if (a == x86_64 && NativeArch::arch() == x86) {
+          FATAL() << "Sorry, tracee " << tid << " is executing in x86-64 mode"
+                  << " and that's not supported with a 32-bit rr.";
+        }
+
         if (a != registers.arch()) {
           registers.set_arch(a);
           registers.set_from_ptrace(ptrace_regs);
@@ -3448,12 +3453,56 @@ static void create_mapping(Task *t, AutoRemoteSyscalls &remote, const KernelMapp
                real_file_name, device, inode, nullptr, &km);
 }
 
-static void apply_mm_map(AutoRemoteSyscalls& remote, const struct prctl_mm_map& map)
+static void apply_mm_map(AutoRemoteSyscalls& remote, const NativeArch::prctl_mm_map& map)
 {
-  AutoRestoreMem remote_mm_map(remote, (const uint8_t*)&map, sizeof(map));
-  remote.infallible_syscall(syscall_number_for_prctl(remote.task()->arch()), PR_SET_MM,
-                            PR_SET_MM_MAP, remote_mm_map.get().as_int(),
-                            sizeof(map));
+  unsigned int expected_size = 0;
+  int result = prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, &expected_size, 0, 0);
+  if (result != 0) {
+    FATAL() << "Failed to get expected MM_MAP_SIZE. Error was " << errno_name(-result);
+  }
+
+  const void* pmap = NULL;
+  int pmap_size = 0;
+
+  /* Expected size matches native prctl_mm_map */
+  if (expected_size == sizeof(map)) {
+    pmap = &map;
+    pmap_size = sizeof(map);
+  }
+
+#if defined(__i386__)
+  /* A 64-bit kernel expects a "64-bit sized" prctl_mm_map
+     even from a 32-bit process. */
+  X64Arch::prctl_mm_map map64;
+  if (expected_size == sizeof(map64)) {
+    LOG(warn) << "Kernel expects different sized MM_MAP. Using 64-bit prctl_mm_map.";
+    memcpy(&map64, &map, sizeof(map));
+    map64.auxv.val = map.auxv.val;
+    map64.auxv_size = map.auxv_size;
+    map64.exe_fd = map.exe_fd;
+
+    pmap = &map64;
+    pmap_size = sizeof(map64);
+  }
+#endif
+
+  /* Are we prepared for the requested structure size? */
+  if (pmap == NULL || pmap_size == 0) {
+    FATAL() << "Kernel expects MM_MAP of size " << expected_size;
+  }
+
+  AutoRestoreMem remote_mm_map(remote, (const uint8_t*)pmap, pmap_size);
+  result = remote.syscall(syscall_number_for_prctl(remote.task()->arch()), PR_SET_MM,
+                          PR_SET_MM_MAP, remote_mm_map.get().as_int(),
+                          pmap_size);
+  if (result == -EINVAL &&
+      (map.start_brk <= map.end_data || map.brk <= map.end_data)) {
+    CLEAN_FATAL() << "The linux kernel prohibits duplication of this task's memory map," <<
+                " because the brk segment is located below the data segment. Sorry.";
+  }
+  else if (result != 0) {
+    FATAL() << "Failed to set target task memory map. Error was " << errno_name(-result);
+  }
 }
 
 static void copy_mem_mapping(Task* from, Task* to, const KernelMapping& km) {
@@ -3488,10 +3537,11 @@ static void move_vdso_mapping(AutoRemoteSyscalls &remote, const KernelMapping &k
   }
 }
 
-const __rlimit_resource all_rlimits[] = {
-  RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS,
-  RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC,
-  RLIMIT_RSS, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK
+const int all_rlimits[] = {
+  (int)RLIMIT_AS, (int)RLIMIT_CORE, (int)RLIMIT_CPU, (int)RLIMIT_DATA,
+  (int)RLIMIT_FSIZE, (int)RLIMIT_LOCKS, (int)RLIMIT_MEMLOCK,
+  (int)RLIMIT_MSGQUEUE, (int)RLIMIT_NICE, (int)RLIMIT_NOFILE, (int)RLIMIT_NPROC,
+  (int)RLIMIT_RSS, (int)RLIMIT_RTTIME, (int)RLIMIT_SIGPENDING, (int)RLIMIT_STACK
 };
 
 void Task::dup_from(Task *other) {
@@ -3500,9 +3550,22 @@ void Task::dup_from(Task *other) {
   bool found_stack = false;
   KernelMapping vdso_mapping;
   bool found_vdso = false;
-  for (KernelMapIterator it(other); !it.at_end(); ++it) {
-    auto km = it.current();
-    if (km.is_stack()) {
+
+  for (auto map : other->vm()->maps()) {
+    auto km = map.map;
+    if (map.flags != AddressSpace::Mapping::FLAG_NONE) {
+      if (map.flags & (AddressSpace::Mapping::IS_THREAD_LOCALS |
+                       AddressSpace::Mapping::IS_RR_PAGE)) {
+        // While under rr control this task already has an rr page and
+        // a thread locals shared segment, don't mess with them.
+        continue;
+      }
+      // For rr private mappings, just make an anonymous segment of the same size
+      km = KernelMapping(km.start(), km.end(), string(), KernelMapping::NO_DEVICE,
+                           KernelMapping::NO_INODE, km.prot(),
+                           (km.flags() & ~MAP_SHARED) | MAP_PRIVATE, 0);
+    }
+    if (km.is_stack() && !found_stack) {
       stack_mapping = km;
       found_stack = true;
     } else {
@@ -3536,14 +3599,15 @@ void Task::dup_from(Task *other) {
   {
     AutoRemoteSyscalls remote_this(this);
     for (auto &km : mappings) {
-      if (km.start() == vm()->rr_page_start() || km.is_vsyscall()) {
+      if (km.is_vsyscall()) {
         continue;
       }
       LOG(debug) << "Creating mapping " << km << " for " << tid;
       create_mapping(this, remote_this, km);
       LOG(debug) << "Copying mapping into " << tid;
-      // XXX: If this maps a file, recreate it as such
-      copy_mem_mapping(other, this, km);
+      if (!(km.flags() & MAP_SHARED)) {
+        copy_mem_mapping(other, this, km);
+      }
     }
     AutoRemoteSyscalls remote_other(other);
     std::vector<int> all_fds = read_all_proc_fds(other->tid);
@@ -3586,21 +3650,24 @@ void Task::dup_from(Task *other) {
     }
 
     // Copy rlimits
-    struct rlimit limit;
+    struct rlimit64 limit;
     for (size_t i = 0; i < (sizeof(all_rlimits)/sizeof(all_rlimits[0])); ++i) {
-      int err = ::prlimit(other->tid, all_rlimits[i], NULL, &limit);
+      int err = syscall(SYS_prlimit64, (uintptr_t)other->tid,
+        (uintptr_t)all_rlimits[i], (uintptr_t)NULL, (uintptr_t)&limit);
       ASSERT(other, err == 0);
-      err = ::prlimit(this->tid, all_rlimits[i], &limit, NULL);
+      err = syscall(SYS_prlimit64, (uintptr_t)this->tid,
+        (uintptr_t)all_rlimits[i], (uintptr_t)&limit, (uintptr_t)NULL);
       ASSERT(this, err == 0);
     }
 
-    struct prctl_mm_map map;
-    memset(&map, 0, sizeof(prctl_mm_map));
+    NativeArch::prctl_mm_map map;
+    memset(&map, 0, sizeof(map));
 
     other->vm()->read_mm_map(other, &map);
     apply_mm_map(remote_this, map);
   }
   copy_state(other->capture_state());
+  activate_preload_thread_locals();
 }
 
 /**

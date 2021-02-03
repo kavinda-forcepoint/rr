@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -126,14 +127,14 @@ std::string read_ld_path(Task* t, remote_ptr<void> interpreter_base) {
   return t->vm()->mapping_of(interpreter_base).map.fsname();
 }
 
-template <typename Arch> void patch_auxv_vdso_arch(RecordTask* t) {
+template <typename Arch> void patch_auxv_vdso_arch(RecordTask* t, uintptr_t search, uintptr_t new_entry_native) {
   auto stack_ptr = auxv_ptr<Arch>(t);
   std::vector<uint8_t> v = read_auxv_arch<Arch>(t, stack_ptr);
   size_t wsize = sizeof(typename Arch::unsigned_word);
   for (int i = 0; (i + 1)*wsize*2 <= v.size(); ++i) {
-    if (*((typename Arch::unsigned_word*)(v.data() + i*2*wsize)) == AT_SYSINFO_EHDR) {
-      auto entry_ptr = stack_ptr + i*2;
-      typename Arch::unsigned_word new_entry = AT_IGNORE;
+    if (*((typename Arch::unsigned_word*)(v.data() + i*2*wsize)) == search) {
+      auto entry_ptr = stack_ptr + i*2 + 1;
+      typename Arch::unsigned_word new_entry = new_entry_native;
       t->write_mem(entry_ptr, new_entry);
       t->record_local(entry_ptr, &new_entry);
       return;
@@ -142,8 +143,8 @@ template <typename Arch> void patch_auxv_vdso_arch(RecordTask* t) {
   return;
 }
 
-void patch_auxv_vdso(RecordTask* t) {
-  RR_ARCH_FUNCTION(patch_auxv_vdso_arch, t->arch(), t);
+void patch_auxv_vdso(RecordTask* t, uintptr_t search, uintptr_t new_entry) {
+  RR_ARCH_FUNCTION(patch_auxv_vdso_arch, t->arch(), t, search, new_entry);
 }
 
 template <typename Arch> static vector<string> read_env_arch(Task* t) {
@@ -1092,6 +1093,10 @@ bool cpuid_compatible(const vector<CPUIDRecord>& trace_records) {
 }
 
 bool cpu_has_xsave_fip_fdp_quirk() {
+  CPUIDData features = cpuid(CPUID_GETFEATURES, 0);
+  if ((features.ecx & XSAVE_FEATURE_FLAG) == 0) {
+    return false;
+  }
 #if defined(__i386__) || defined(__x86_64__)
   uint64_t xsave_buf[576/sizeof(uint64_t)] __attribute__((aligned(64)));
   xsave_buf[1] = 0;
@@ -2129,5 +2134,28 @@ int pop_count(uint64_t v) {
   }
   return ret;
 }
+
+void SAFE_FATAL(int err, const char *msg)
+{
+  static char prefix[] = "FATAL (errno = ";
+  const char *errstr = errno_name_cstr(err);
+  char buf[100];
+  if (errstr == NULL) {
+    snprintf(buf, sizeof(buf), "errno(%d)", err);
+    errstr = buf;
+  }
+  static char bridge[] = "): ";
+  static char nl[] = "\n";
+  struct iovec out[5] = {
+    {.iov_base = prefix, .iov_len=sizeof(prefix)},
+    {.iov_base = (char*)errstr, .iov_len=strlen(errstr)},
+    {.iov_base = bridge, .iov_len=sizeof(errstr)},
+    {.iov_base = (char*)msg, .iov_len=strlen(msg)},
+    {.iov_base = nl, .iov_len=sizeof(nl)}
+  };
+  ::writev(STDERR_FILENO, out, sizeof(out)/sizeof(struct iovec));
+  abort();
+}
+
 
 } // namespace rr

@@ -645,8 +645,8 @@ Switchable TaskSyscallState::done_preparing_internal(Switchable sw) {
         << "`" << t->ev().Syscall().syscall_name()
         << "' needed a scratch buffer of size " << scratch - t->scratch_ptr
         << ", but only " << t->usable_scratch_size()
-        << " was available.  Disabling context switching: deadlock may follow.";
-    switchable = PREVENT_SWITCH;
+        << " was available.  Allowing the syscall to proceed without scratch, which may race.";
+    return switchable;
   }
   if (switchable == PREVENT_SWITCH || param_list.empty()) {
     return switchable;
@@ -2997,24 +2997,7 @@ static void prepare_mmap_register_params(RecordTask* t) {
 #ifdef MAP_32BIT
   mask_flag |= MAP_32BIT;
 #endif
-  int fd = r.arg5_signed();
-  size_t offset = r.arg6();
-  size_t length = r.arg2();
-  intptr_t flags = r.arg4_signed();
-  FileMonitor *fd_monitor = t->fd_table()->get_monitor(fd);
-  if (fd > 0 && fd_monitor && fd_monitor->type() == FileMonitor::RRPage) {
-    LOG(debug) << "Got request to map rr page";
-    if (offset == 0 && !(flags & MAP_FIXED) && length <= 2*page_size()) {
-      // If the dynamic linker allows us to map the rr page anywhere, ask to
-      // map it at the address we need it to be to match RR_PAGE_ADDR.
-      // N.B. rr_page.ld sets this layout. If the layout is edited, this may
-      // need to be adjusted.
-      r.set_arg1(RR_PAGE_ADDR - page_size());
-      r.set_arg2(page_size());
-      r.set_arg4(flags | MAP_FIXED);
-    }
-  }
-  else if (t->session().enable_chaos() &&
+  if (t->session().enable_chaos() &&
       !(r.arg4_signed() & mask_flag) && r.arg1() == 0) {
     // No address hint was provided. Randomize the allocation address.
     size_t len = r.arg2();
@@ -3343,12 +3326,13 @@ static pid_t do_detach_teleport(RecordTask *t)
     AutoRemoteSyscalls remote(new_t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
     remote.syscall(syscall_number_for_close(new_t->arch()), tracee_fd_number);
   }
+  t->vm()->monkeypatcher().unpatch_syscalls_in(new_t);
   // Try to reset the scheduler affinity that we enforced upon the task.
   // XXX: It would be nice to track what affinity the tracee requested and
   // restore that.
   cpu_set_t mask;
   memset(&mask, 0xFF, sizeof(mask));
-  sched_setaffinity(new_t->tid, sizeof(mask), &mask);
+  syscall(SYS_sched_setaffinity, new_t->tid, sizeof(mask), &mask);
   new_t->detach();
   new_t->did_kill();
   delete new_t;
@@ -4331,6 +4315,19 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           syscall_state.emulate_result(0);
           break;
         }
+
+        case PR_SET_MM:{
+          switch ((unsigned long)regs.arg2()) {
+            case PR_SET_MM_MAP_SIZE:
+              syscall_state.reg_parameter(3, sizeof(unsigned int));
+              break;
+
+            default:
+              syscall_state.expect_errno = EINVAL;
+              break;
+          }
+        }
+        break;
 
         default:
           syscall_state.expect_errno = EINVAL;
@@ -5336,23 +5333,6 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
     auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat(), km.fsname(), vector<TraceRemoteFd>());
     ASSERT(t, d == TraceWriter::DONT_RECORD_IN_TRACE);
     return;
-  }
-
-  FileMonitor *fd_monitor = t->fd_table()->get_monitor(fd);
-  if (fd_monitor && fd_monitor->type() == FileMonitor::RRPage) {
-    LOG(debug) << "Processing mmap of rr page";
-    if (offset_pages == 1 && length <= page_size() &&
-        addr == RR_PAGE_ADDR && t->vm()->has_rr_page()) {
-      // If this is a remap of the rr page at the RR_PAGE_ADDR, skip all further
-      // processing. We silently already did this just after exec.
-      KernelMapping rr_page_mapping =
-          t->vm()->mapping_of(AddressSpace::rr_page_start()).map;
-      auto d = t->trace_writer().write_mapped_region(t, rr_page_mapping,
-        rr_page_mapping.fake_stat(), rr_page_mapping.fsname(),
-        vector<TraceRemoteFd>(), TraceWriter::RR_BUFFER_MAPPING);
-      ASSERT(t, d == TraceWriter::DONT_RECORD_IN_TRACE);
-      return;
-    }
   }
 
   ASSERT(t, fd >= 0) << "Valid fd required for file mapping";

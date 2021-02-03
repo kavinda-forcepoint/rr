@@ -439,7 +439,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       }
       {
         auto it = memory_files.find(read_req.fd);
-        if (it != memory_files.end()) {
+        if (it != memory_files.end() && timeline.is_running()) {
           // Search our mmap stream for a record that can satisfy this request
           TraceReader tmp_reader(timeline.current_session().trace_reader());
           tmp_reader.rewind();
@@ -1834,12 +1834,33 @@ static ScopedFd generate_fake_proc_maps(Task* t) {
   }
   FILE* f = fdopen(fd, "w");
 
+
   int addr_min_width = word_size(t->arch()) == 8 ? 10 : 8;
-  for (auto& m : t->vm()->maps()) {
+  for (AddressSpace::Maps::iterator it = t->vm()->maps().begin();
+       it != t->vm()->maps().end(); ++it) {
+    // If this is the mapping just before the rr page and it's still librrpage,
+    // merge this mapping with the subsequent one. We'd like gdb to treat
+    // librrpage as the vdso, but it'll only do so if the entire vdso is one
+    // mapping.
+    auto m = *it;
+    uintptr_t map_end = (long long)m.recorded_map.end().as_int();
+    if (m.recorded_map.end() == t->vm()->rr_page_start()) {
+      auto it2 = it;
+      if (++it2 != t->vm()->maps().end()) {
+        auto m2 = *it2;
+        if (m2.flags & AddressSpace::Mapping::IS_RR_PAGE) {
+          // Extend this mapping
+          map_end += t->vm()->rr_page_size();
+          // Skip the rr page
+          ++it;
+        }
+      }
+    }
+
     int len =
         fprintf(f, "%0*llx-%0*llx %s%s%s%s %08llx %02x:%02x %lld",
                 addr_min_width, (long long)m.recorded_map.start().as_int(),
-                addr_min_width, (long long)m.recorded_map.end().as_int(),
+                addr_min_width, (long long)map_end,
                 (m.recorded_map.prot() & PROT_READ) ? "r" : "-",
                 (m.recorded_map.prot() & PROT_WRITE) ? "w" : "-",
                 (m.recorded_map.prot() & PROT_EXEC) ? "x" : "-",
